@@ -181,9 +181,20 @@ class TervynVpnService : VpnService() {
         ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), type)
     }
 
+    private var lastShown = ""
+    private var lastShownAt = 0L
+
     private fun updateNotification() {
         val st = Core.state.value
         if (st.status.state == "off") return
+        // Android drops updates that come too fast, so only post real changes, at most once a second.
+        val key = "${st.status.state}|${st.status.label}|${st.freeStatus.state}|${st.freeStatus.progress}|${st.prefs.sites.size}"
+        val now = System.currentTimeMillis()
+        synchronized(this) {
+            if (key == lastShown || (now - lastShownAt < 1000 && st.status.state == "connecting")) return
+            lastShown = key
+            lastShownAt = now
+        }
         runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification()) }
     }
 }

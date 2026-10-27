@@ -231,14 +231,16 @@ object Core {
         if (list.isEmpty()) {
             // Nothing yet: wait for the search and connect as soon as servers show up.
             if (refreshing == null) refreshFreeAsync()
-            Thread.sleep(500)
-            val deadline = System.currentTimeMillis() + 180_000
+            val start = System.currentTimeMillis()
+            val deadline = start + 180_000
             var firstFoundAt = 0L
             while (System.currentTimeMillis() < deadline) {
                 list = working()
                 if (list.isNotEmpty() && firstFoundAt == 0L) firstFoundAt = System.currentTimeMillis()
+                // Search finished (give it a moment to start first).
+                val searchDone = refreshing == null && System.currentTimeMillis() - start > 3000
                 // Connect with 2+ servers (one is a backup), or with 1 after a short wait.
-                if (list.size >= 2 || refreshing == null || (firstFoundAt > 0 && System.currentTimeMillis() - firstFoundAt > 6000)) break
+                if (list.size >= 2 || searchDone || (firstFoundAt > 0 && System.currentTimeMillis() - firstFoundAt > 6000)) break
                 if (!_state.value.prefs.enabled) return emptyList()
                 Thread.sleep(1000)
             }

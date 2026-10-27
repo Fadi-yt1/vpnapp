@@ -16,10 +16,9 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
-
       - uses: gradle/actions/setup-gradle@v4
 
+      # The Ubuntu runner already has the Android SDK; Gradle fetches any missing platform.
       - name: Build APKs
         run: ./gradlew --no-daemon assembleDebug assembleRelease lint
 

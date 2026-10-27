@@ -22,6 +22,10 @@ jobs:
       - name: Build APKs
         run: ./gradlew --no-daemon assembleDebug assembleRelease lint
 
+      - name: Show lint results
+        if: always()
+        run: cat app/build/reports/lint.txt || true
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:

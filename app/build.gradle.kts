@@ -38,7 +38,7 @@ android {
         // Report problems without failing the build; the report is uploaded by CI.
         abortOnError = false
         textReport = true
-        textOutput = file("stdout")
+        textOutput = file("build/reports/lint.txt")
     }
     buildFeatures {
         compose = true

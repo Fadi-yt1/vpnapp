@@ -124,7 +124,7 @@ object FreeProxies {
     fun fromJson(data: Any?, source: String): List<Server> {
         val out = ArrayList<Server>()
         fun pick(o: JSONObject, vararg keys: String): Any? {
-            for (k in keys) if (o.has(k) && !o.isNull(k) && o.opt(k).toString().isNotEmpty()) return o.opt(k)
+            for (k in keys) if (o.has(k) && !o.isNull(k) && o.opt(k)?.toString().orEmpty().isNotEmpty()) return o.opt(k)
             return null
         }
         fun walk(v: Any?, depth: Int) {

@@ -54,7 +54,7 @@ class TunEngine(
     fun start() {
         running = true
         Thread({ loop() }, "tervyn-tun").apply { isDaemon = true }.start()
-        timer.scheduleAtFixedRate({ tick() }, 250, 250, TimeUnit.MILLISECONDS)
+        timer.scheduleWithFixedDelay({ tick() }, 250, 250, TimeUnit.MILLISECONDS)
     }
 
     fun stop() {

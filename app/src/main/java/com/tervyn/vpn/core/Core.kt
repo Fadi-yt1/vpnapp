@@ -34,6 +34,7 @@ object Core {
     private const val HEALTH_MIN = 2L
     private const val IP_CHECK_HOST = "ipwho.is"
 
+    @android.annotation.SuppressLint("StaticFieldLeak") // application context, lives as long as the app
     private lateinit var app: Context
     private lateinit var store: Store
     private val lock = Any()

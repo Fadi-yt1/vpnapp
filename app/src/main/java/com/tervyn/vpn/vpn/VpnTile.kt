@@ -1,5 +1,6 @@
 package com.tervyn.vpn.vpn
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
@@ -36,6 +37,7 @@ class VpnTile : TileService() {
         }
     }
 
+    @SuppressLint("StartActivityAndCollapseDeprecated") // old call only runs below Android 14
     private fun openApp() {
         val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (Build.VERSION.SDK_INT >= 34) {

@@ -130,7 +130,12 @@ fun HomeScreen(st: AppState, onPower: () -> Unit, goTo: (Int) -> Unit) {
                 )
                 Text(
                     when {
-                        active == null -> "Auto · picks the fastest free server" +
+                        active == null -> "Auto · picks the fastest " + when (prefs.source) {
+                            Prefs.SOURCE_PROXIO -> "Proxio.io server"
+                            Prefs.SOURCE_BOTH -> "Proxio.io or free server"
+                            Prefs.SOURCE_OWN -> "of your servers"
+                            else -> "free server"
+                        } +
                             (if (prefs.country.isNotEmpty()) " in ${com.tervyn.vpn.core.countryName(prefs.country)}" else "")
                         on -> st.status.label
                         else -> serverSub(active)

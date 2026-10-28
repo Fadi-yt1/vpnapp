@@ -20,7 +20,7 @@ jobs:
 
       # The Ubuntu runner already has the Android SDK; Gradle fetches any missing platform.
       - name: Build APKs
-        run: ./gradlew --no-daemon assembleDebug assembleRelease lint
+        run: ./gradlew --no-daemon -PrequireXray=true assembleDebug assembleRelease lint
 
       - name: Show lint results
         if: always()
@@ -31,8 +31,8 @@ jobs:
         with:
           name: tervyn-vpn-apk
           path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/app-universal-debug.apk
           if-no-files-found: error
 
       - name: Upload lint report

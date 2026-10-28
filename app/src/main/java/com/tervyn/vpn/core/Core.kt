@@ -5,14 +5,17 @@ import android.net.ConnectivityManager
 import android.util.Log
 import com.tervyn.vpn.net.ProxyDeadException
 import com.tervyn.vpn.net.ProxyDialer
+import com.tervyn.vpn.net.ProxyEndpoint
 import com.tervyn.vpn.net.ProxyTester
 import com.tervyn.vpn.vpn.FakeDns
 import com.tervyn.vpn.vpn.Router
 import com.tervyn.vpn.vpn.TervynVpnService
+import com.tervyn.vpn.xray.XrayProcess
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.InetAddress
@@ -21,18 +24,21 @@ import java.net.Socket
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * The app's brain (same job as background.js in the extension): finds and
- * tests free servers, picks the fastest, keeps backups ready, swaps out dead
- * ones and tells the VPN service where to send traffic.
+ * The app's brain (same job as background.js in the extension): gets servers
+ * from the chosen source (free lists, Proxio.io, or your own), tests them,
+ * picks the fastest, keeps backups ready, swaps out dead ones, runs Xray for
+ * VLESS / VMess / Trojan / Shadowsocks servers and tells the VPN where to send traffic.
  */
 object Core {
     private const val TAG = "Tervyn"
     private const val KEEP_FREE = 40
-    private const val FREE_REFRESH_MIN = 30L
+    private const val REFRESH_MIN = 30L
     private const val HEALTH_MIN = 2L
     private const val IP_CHECK_HOST = "ipwho.is"
+    private const val XRAY_MISSING = "This copy of the app was built without Xray, so VLESS / VMess / Trojan / Shadowsocks servers can't be used. SOCKS5 and HTTP servers work."
 
     @android.annotation.SuppressLint("StaticFieldLeak") // application context, lives as long as the app
     private lateinit var app: Context
@@ -48,27 +54,50 @@ object Core {
     /** Stand-in addresses survive reconnects, so apps' cached DNS answers keep working. */
     val fakeDns = FakeDns()
 
-    @Volatile private var chain: List<Server> = emptyList()   // servers in use (first = main, rest = backups)
+    // Servers in use (first = main, rest = backups) and how to reach each one.
+    @Volatile private var chain: List<Server> = emptyList()
+    @Volatile private var chainEndpoints: List<ProxyEndpoint> = emptyList()
+
     @Volatile private var refreshing: Thread? = null
+    @Volatile private var proxioRefreshing: Thread? = null
+    private val proxioLock = Object()
     @Volatile private var connecting = false
     @Volatile private var checkingHealth = false
     @Volatile private var service: TervynVpnService? = null
     private val failTimes = ArrayDeque<Long>()
+    private val listeners = mutableListOf<() -> Unit>()
 
-    private var listeners = mutableListOf<() -> Unit>()
+    // Xray-core (bundled as libxray.so so Android lets us run it).
+    private var xrayBin: File? = null
+    private val xrayDir: File get() = File(app.filesDir, "xray")
+    private val xrayLock = Any()
+    @Volatile private var mainXray: XrayProcess? = null
+    private val testCounter = AtomicInteger()
 
     fun init(context: Context) {
         app = context.applicationContext
         store = Store(app)
-        val prefs = store.prefs()
         _state.value = AppState(
-            prefs = prefs, free = store.freeServers(), own = store.ownServers(),
+            prefs = store.prefs(), free = store.freeServers(), own = store.ownServers(),
+            proxio = store.proxioServers(), proxioConfig = store.proxioConfig(), proxioStatus = store.proxioStatus(),
             sources = store.sources(), freeStatus = store.freeStatus(),
         )
+        xrayBin = File(app.applicationInfo.nativeLibraryDir, "libxray.so").takeIf { it.exists() }
+        bg {
+            val bin = xrayBin ?: return@bg
+            XrayProcess.killLeftovers(bin)
+            val v = runCatching {
+                val p = ProcessBuilder(bin.absolutePath, "version").redirectErrorStream(true).start()
+                p.inputStream.bufferedReader().readLine().orEmpty().also { p.waitFor(5, TimeUnit.SECONDS) }
+            }.getOrDefault("")
+            val ver = Regex("Xray ([\\d.]+)").find(v)?.groupValues?.get(1) ?: if (v.isNotBlank()) "?" else ""
+            update { it.copy(xrayVersion = ver) }
+        }
         sched.scheduleWithFixedDelay({ safe { healthCheck() } }, HEALTH_MIN, HEALTH_MIN, TimeUnit.MINUTES)
-        sched.scheduleWithFixedDelay({ safe { refreshListUrls(); refreshFree(force = true) } },
-            FREE_REFRESH_MIN, FREE_REFRESH_MIN, TimeUnit.MINUTES)
+        sched.scheduleWithFixedDelay({ safe { periodicRefresh() } }, REFRESH_MIN, REFRESH_MIN, TimeUnit.MINUTES)
     }
+
+    val xrayIncluded: Boolean get() = xrayBin != null
 
     /** Called on every state change (the VPN service and quick-settings tile use it). */
     fun addListener(l: () -> Unit) { synchronized(listeners) { listeners.add(l) } }
@@ -83,6 +112,11 @@ object Core {
     private fun setStatus(f: (Status) -> Status) = update { it.copy(status = f(it.status)) }
     private fun setFree(f: (FreeStatus) -> FreeStatus) = update { it.copy(freeStatus = f(it.freeStatus)) }
 
+    private fun setProxioStatus(st: ProxioStatus) {
+        update { it.copy(proxioStatus = st) }
+        store.saveProxioStatus(st)
+    }
+
     private fun savePrefs(f: (Prefs) -> Prefs): Prefs {
         var p: Prefs? = null
         update { s -> s.copy(prefs = f(s.prefs)).also { p = it.prefs } }
@@ -95,19 +129,96 @@ object Core {
         store.saveFreeServers(list)
     }
 
+    private fun saveProxio(list: List<Server>) {
+        update { it.copy(proxio = list) }
+        store.saveProxioServers(list)
+    }
+
+    private fun saveOwn(list: List<Server>) {
+        update { it.copy(own = list) }
+        store.saveOwnServers(list)
+    }
+
     private fun safe(block: () -> Unit) = try { block() } catch (e: Exception) { Log.w(TAG, "task failed", e) }
     private fun bg(block: () -> Unit) = exec.execute { safe(block) }
+
+    private fun periodicRefresh() {
+        val p = _state.value.prefs
+        refreshListUrls()
+        if (p.usesProxio) runCatching { refreshProxio() }
+        if (p.usesFree) refreshFree(force = true)
+        if (p.source == Prefs.SOURCE_OWN) testOwn(_state.value.own)
+    }
+
+    // =====================================================================
+    // Testing (plain proxies directly, VLESS & co. through Xray)
+    // =====================================================================
+
+    private class Tagged(val server: Server, ep: ProxyEndpoint) : ProxyEndpoint by ep
+
+    /**
+     * Tests servers with the HTTPS check. VLESS / VMess / Trojan / Shadowsocks
+     * servers are tested through Xray: the running one if it already serves
+     * them, otherwise a temporary one.
+     */
+    private fun testServers(
+        list: List<Server>,
+        threads: Int = 64,
+        stopAfter: Int = Int.MAX_VALUE,
+        maxTimeMs: Long = Long.MAX_VALUE,
+        onResult: (Server, ProxyTester.Result?) -> Unit,
+    ) {
+        val direct = list.filter { !it.isCore }
+        val core = list.filter { it.isCore }
+        if (direct.isNotEmpty()) ProxyTester.testMany(direct, threads, stopAfter, maxTimeMs, onResult)
+        if (core.isEmpty()) return
+        val bin = xrayBin
+        if (bin == null) {
+            synchronized(ProxyTester) { core.forEach { onResult(it, null) } }
+            return
+        }
+        val main = mainXray
+        val inMain = if (main != null && main.alive) core.filter { main.endpoints.containsKey(it.id) } else emptyList()
+        if (inMain.isNotEmpty()) testVia(inMain, main!!.endpoints, threads, onResult)
+        for (chunk in (core - inMain.toSet()).chunked(48)) {
+            val x = XrayProcess(bin, xrayDir, "test${testCounter.incrementAndGet()}", chunk)
+            try {
+                x.start()
+            } catch (e: Exception) {
+                Log.w(TAG, "xray test start failed", e)
+                synchronized(ProxyTester) { chunk.forEach { onResult(it, null) } }
+                continue
+            }
+            try {
+                testVia(chunk, x.endpoints, threads, onResult)
+            } finally {
+                x.stop()
+            }
+        }
+    }
+
+    private fun testVia(servers: List<Server>, eps: Map<String, ProxyEndpoint>, threads: Int, onResult: (Server, ProxyTester.Result?) -> Unit) {
+        val tagged = servers.mapNotNull { s -> eps[s.id]?.let { Tagged(s, it) } }
+        synchronized(ProxyTester) { servers.filter { it.id !in eps }.forEach { onResult(it, null) } } // Xray refused these
+        ProxyTester.testMany(tagged, threads) { t, r -> onResult(t.server, r) }
+    }
 
     // =====================================================================
     // Free servers: find, test, keep the fastest
     // =====================================================================
 
-    /** Start a search in the background if the list is old or short (called when the app opens). */
-    fun ensureFree() = bg { refreshFree(force = false) }
+    /** Called when the app opens: refresh lists that are old or short. */
+    fun ensureFree() = bg {
+        val p = _state.value.prefs
+        if (p.usesProxio && System.currentTimeMillis() - _state.value.proxioStatus.at > REFRESH_MIN * 60_000) {
+            runCatching { refreshProxio() }
+        }
+        if (p.usesFree) refreshFree(force = false)
+    }
 
     fun refreshFreeAsync() = bg { refreshFree(force = true) }
 
-    val isRefreshing get() = refreshing != null
+    val isRefreshing get() = refreshing != null || proxioRefreshing != null
 
     fun refreshFree(force: Boolean) {
         synchronized(this) {
@@ -163,7 +274,7 @@ object Core {
             store.saveFreeStatus(fs)
             // Move an active connection onto the fresh list.
             val s = _state.value
-            if (final.isNotEmpty() && s.on && s.prefs.selected == "auto" && !connecting) repick()
+            if (final.isNotEmpty() && s.on && s.prefs.selected == "auto" && s.prefs.usesFree && !connecting) repick()
         } catch (e: Exception) {
             val fs = _state.value.freeStatus.copy(state = "idle", at = System.currentTimeMillis(), error = e.message ?: e.toString())
             update { it.copy(freeStatus = fs) }
@@ -173,6 +284,74 @@ object Core {
         }
     }
 
+    // =====================================================================
+    // Proxio.io servers (your API key)
+    // =====================================================================
+
+    /** Downloads and tests your Proxio.io list. Throws with a readable message on failure. */
+    fun refreshProxio(): ProxioStatus {
+        val cfg = _state.value.proxioConfig
+        if (cfg.key.isBlank()) return _state.value.proxioStatus
+        synchronized(proxioLock) {
+            if (proxioRefreshing != null) {
+                // Someone else is loading it: wait for that result.
+                while (proxioRefreshing != null) proxioLock.wait(500)
+                return _state.value.proxioStatus
+            }
+            proxioRefreshing = Thread.currentThread()
+        }
+        try {
+            setProxioStatus(_state.value.proxioStatus.copy(state = "loading", error = ""))
+            val list = Proxio.fetch(cfg)
+            if (list.isEmpty()) throw IOException("Proxio.io returned no usable servers. Check your plan and the server type.")
+            setProxioStatus(_state.value.proxioStatus.copy(state = "testing", fetched = list.size))
+            val working = ArrayList<Server>()
+            testServers(list) { s, r ->
+                if (r != null) working += s.copy(ms = r.ms, code = r.code.ifEmpty { s.code }, testedAt = System.currentTimeMillis())
+            }
+            working.sortBy { it.ms }
+            saveProxio(working)
+            val st = ProxioStatus(
+                at = System.currentTimeMillis(), fetched = list.size, working = working.size,
+                error = if (working.isEmpty()) "Proxio.io sent ${list.size} servers, but none answered the speed test. Try again in a few minutes." else "",
+            )
+            setProxioStatus(st)
+            val s = _state.value
+            if (working.isNotEmpty() && s.on && s.prefs.usesProxio && s.prefs.selected == "auto" && !connecting) repick()
+            return st
+        } catch (e: Exception) {
+            setProxioStatus(_state.value.proxioStatus.copy(state = "idle", at = System.currentTimeMillis(), error = e.message ?: e.toString()))
+            throw e
+        } finally {
+            synchronized(proxioLock) {
+                proxioRefreshing = null
+                proxioLock.notifyAll()
+            }
+        }
+    }
+
+    /** Save the key (blank = keep the saved one), load the list, and switch to Proxio.io if it works. */
+    fun proxioSave(key: String, type: String, limit: Int): ProxioStatus {
+        val old = _state.value.proxioConfig
+        val cfg = Proxio.Config(key.trim().ifEmpty { old.key }, type, limit)
+        if (cfg.key.isBlank()) throw IOException("Enter your Proxio.io API key first.")
+        update { it.copy(proxioConfig = cfg) }
+        store.saveProxioConfig(cfg)
+        val st = refreshProxio()
+        if (st.working > 0 && !_state.value.prefs.usesProxio) setSource(Prefs.SOURCE_PROXIO)
+        return st
+    }
+
+    fun proxioRemove() {
+        store.removeProxio()
+        update { it.copy(proxio = emptyList(), proxioConfig = Proxio.Config(), proxioStatus = ProxioStatus()) }
+        if (_state.value.prefs.usesProxio) setSource(Prefs.SOURCE_FREE)
+    }
+
+    // =====================================================================
+    // Health checks
+    // =====================================================================
+
     /** Re-checks the servers in use; swaps out dead ones and tops up the list. */
     private fun healthCheck() {
         val s = _state.value
@@ -181,32 +360,43 @@ object Core {
         try {
             val inUse = chain
             if (inUse.isEmpty()) return
+            // Xray stopped (e.g. Android killed it): start it again.
+            if (inUse.any { it.isCore } && mainXray?.alive != true) {
+                runCatching { activate(inUse) }
+            }
             val results = HashMap<String, ProxyTester.Result?>()
-            ProxyTester.testMany(inUse, threads = inUse.size) { srv, r -> results[srv.id] = r }
+            testServers(inUse, threads = inUse.size) { srv, r -> results[srv.id] = r }
             val now = System.currentTimeMillis()
             val dead = inUse.filter { results[it.id] == null }.map { it.id }.toSet()
-            // Update delays shown in the app.
-            fun upd(l: List<Server>) = l.mapNotNull { srv ->
+            fun upd(l: List<Server>, dropDead: Boolean) = l.mapNotNull { srv ->
                 when {
-                    srv.id in dead && srv.free -> null
+                    srv.id in dead && dropDead -> null
                     srv.id in dead -> srv.copy(ms = null, testedAt = now)
                     results.containsKey(srv.id) -> srv.copy(ms = results[srv.id]!!.ms, testedAt = now)
                     else -> srv
                 }
             }
-            saveFree(upd(_state.value.free))
-            update { it.copy(own = upd(it.own)) }
-            store.saveOwnServers(_state.value.own)
+            saveFree(upd(_state.value.free, dropDead = true))
+            saveProxio(upd(_state.value.proxio, dropDead = true))
+            saveOwn(upd(_state.value.own, dropDead = false))
             if (dead.isNotEmpty() && !connecting && refreshing == null) {
                 if (inUse.first().id in dead) {
-                    setStatus { it.copy(warning = if (_state.value.prefs.selected == "auto")
-                        "A server stopped answering — switched to the next fastest one."
-                    else "The server you picked isn't answering. Pick another one or use Fastest.") }
+                    setStatus {
+                        it.copy(warning = if (_state.value.prefs.selected == "auto")
+                            "A server stopped answering — switched to the next fastest one."
+                        else "The server you picked isn't answering. Pick another one or use Fastest.")
+                    }
                 }
                 repick()
             }
-            val left = _state.value.free.count { it.ms != null }
-            if (left < 10 && System.currentTimeMillis() - _state.value.freeStatus.at > 5 * 60_000) refreshFree(force = true)
+            val p = _state.value.prefs
+            val since = { at: Long -> System.currentTimeMillis() - at > 5 * 60_000 }
+            if (p.usesProxio && _state.value.proxio.count { it.ms != null } < 3 && since(_state.value.proxioStatus.at)) {
+                runCatching { refreshProxio() }
+            }
+            if (p.usesFree && _state.value.free.count { it.ms != null } < 10 && since(_state.value.freeStatus.at)) {
+                refreshFree(force = true)
+            }
         } finally {
             checkingHealth = false
         }
@@ -221,11 +411,42 @@ object Core {
         if (prefs.selected != "auto") {
             st.servers.firstOrNull { it.id == prefs.selected }?.let { return listOf(it) }
         }
-        fun working() = _state.value.servers.filter { it.ms != null }
         fun inCountry(l: List<Server>) = if (prefs.country.isEmpty()) l
             else l.filter { it.code == prefs.country }.ifEmpty { l }
+        fun best(l: List<Server>) = inCountry(l.filter { it.ms != null }).sortedBy { it.ms }.take(maxOf(2, prefs.autoPool))
 
-        var list = working()
+        when (prefs.source) {
+            Prefs.SOURCE_OWN -> {
+                var list = best(_state.value.own)
+                if (list.isEmpty()) {
+                    if (_state.value.own.isEmpty()) {
+                        throw IOException("You haven't added any servers yet. Add them under Servers → Your own servers, or choose another server source in Settings.")
+                    }
+                    testOwn(_state.value.own)
+                    list = best(_state.value.own)
+                }
+                if (list.isEmpty()) throw IOException("None of your servers answered the speed test. Check them, or choose another server source in Settings.")
+                return list
+            }
+            Prefs.SOURCE_PROXIO -> {
+                var list = best(_state.value.proxio)
+                if (list.isEmpty()) {
+                    if (_state.value.proxioConfig.key.isBlank()) throw IOException("Add your Proxio.io API key in Settings, or choose another server source.")
+                    runCatching { refreshProxio() }
+                    list = best(_state.value.proxio)
+                }
+                if (list.isEmpty()) {
+                    throw IOException(_state.value.proxioStatus.error.ifEmpty {
+                        "No working Proxio.io server right now. Check your API key in Settings, or switch the server source to free servers."
+                    })
+                }
+                return list
+            }
+        }
+
+        // Free servers (and Proxio.io servers when the source is "both").
+        fun working() = (if (prefs.usesProxio) _state.value.proxio else emptyList()) + _state.value.free
+        var list = working().filter { it.ms != null }
         if (list.size < 3 && refreshing == null && System.currentTimeMillis() - st.freeStatus.at > 5 * 60_000) {
             refreshFreeAsync()
         }
@@ -236,7 +457,7 @@ object Core {
             val deadline = start + 180_000
             var firstFoundAt = 0L
             while (System.currentTimeMillis() < deadline) {
-                list = working()
+                list = working().filter { it.ms != null }
                 if (list.isNotEmpty() && firstFoundAt == 0L) firstFoundAt = System.currentTimeMillis()
                 // Search finished (give it a moment to start first).
                 val searchDone = refreshing == null && System.currentTimeMillis() - start > 3000
@@ -246,7 +467,7 @@ object Core {
                 Thread.sleep(1000)
             }
         }
-        return inCountry(list).sortedBy { it.ms }.take(maxOf(2, prefs.autoPool))
+        return best(list)
     }
 
     private fun label(prefs: Prefs, servers: List<Server>): String {
@@ -257,14 +478,51 @@ object Core {
         } else "${first.flag} $place"
     }
 
+    /**
+     * Makes [servers] the ones in use. Starts (or restarts) Xray when some of
+     * them are VLESS / VMess / Trojan / Shadowsocks servers.
+     */
+    private fun activate(servers: List<Server>) {
+        synchronized(xrayLock) {
+            val core = servers.filter { it.isCore }
+            if (core.isEmpty()) {
+                mainXray?.stop()
+                mainXray = null
+            } else {
+                val bin = xrayBin ?: throw IOException(XRAY_MISSING)
+                val cur = mainXray
+                if (cur == null || !cur.alive || cur.servers.map { it.id }.toSet() != core.map { it.id }.toSet()) {
+                    // Start the new one before stopping the old one, so traffic keeps flowing.
+                    val x = XrayProcess(bin, xrayDir, "main", core)
+                    x.start()
+                    cur?.stop()
+                    mainXray = x
+                }
+            }
+            val x = mainXray
+            val usable = servers.filter { !it.isCore || x?.endpoints?.containsKey(it.id) == true }
+            if (usable.isEmpty()) throw IOException("Xray could not use these servers. ${x?.lastError().orEmpty()}".trim())
+            chainEndpoints = usable.map { if (it.isCore) x!!.endpoints.getValue(it.id) else it }
+            chain = usable
+        }
+    }
+
     /** Switch servers while connected, without dropping the VPN. */
     private fun repick() {
         val prefs = _state.value.prefs
         if (!_state.value.on) return
-        val servers = pickServers(prefs)
+        val servers = runCatching { pickServers(prefs) }.getOrElse { e ->
+            setStatus { it.copy(warning = e.message ?: e.toString()) }
+            return
+        }
         if (servers.isEmpty()) return
-        chain = servers
-        setStatus { it.copy(label = label(prefs, servers), serverIds = servers.map { s -> s.id }) }
+        try {
+            activate(servers)
+        } catch (e: Exception) {
+            setStatus { it.copy(warning = e.message ?: e.toString()) }
+            return
+        }
+        setStatus { it.copy(label = label(prefs, chain), serverIds = chain.map { s -> s.id }) }
     }
 
     // =====================================================================
@@ -296,30 +554,41 @@ object Core {
             val servers = pickServers(prefs)
             if (!_state.value.prefs.enabled) return   // user pressed stop while we were searching
             if (servers.isEmpty()) {
-                throw IOException("No free server is answering right now. Tap \"Find fastest free servers\" in the Servers tab, or try again in a minute.")
+                throw IOException("No free server is answering right now. Tap \"Find fastest servers\" in the Servers tab, or try again in a minute.")
             }
-            chain = servers
+            activate(servers)
             svc.startTunnel(fullMode = !prefs.targeted, router = router)
             setStatus {
-                Status(state = "on", label = label(prefs, servers), serverIds = servers.map { it.id },
+                Status(state = "on", label = label(prefs, chain), serverIds = chain.map { it.id },
                     since = if (wasOn) it.since else System.currentTimeMillis())
             }
             update { it.copy(ipText = "") }
         } catch (e: Exception) {
             Log.w(TAG, "connect failed", e)
             savePrefs { it.copy(enabled = false) }
-            chain = emptyList()
+            clearChain()
             svc.stopTunnel()
             setStatus { Status(state = "off", error = e.message ?: e.toString()) }
+        }
+    }
+
+    private fun clearChain() {
+        chain = emptyList()
+        chainEndpoints = emptyList()
+        synchronized(xrayLock) {
+            mainXray?.stop()
+            mainXray = null
         }
     }
 
     /** Stop button, tile, notification, or Android revoked the VPN. */
     fun disconnect() {
         savePrefs { it.copy(enabled = false) }
-        chain = emptyList()
         service?.stopTunnel()
         service = null
+        bg { clearChain() }
+        chain = emptyList()
+        chainEndpoints = emptyList()
         setStatus { Status(state = "off") }
         update { it.copy(ipText = "") }
     }
@@ -327,7 +596,7 @@ object Core {
     fun serviceDestroyed(svc: TervynVpnService) {
         if (service !== svc) return
         service = null
-        chain = emptyList()
+        bg { clearChain() }
         if (_state.value.status.state != "off") setStatus { Status(state = "off") }
     }
 
@@ -344,13 +613,13 @@ object Core {
         }
 
         override fun connectProxied(host: String, port: Int): Socket {
-            val servers = chain
-            if (servers.isEmpty()) throw IOException("VPN is not connected")
+            val eps = chainEndpoints
+            if (eps.isEmpty()) throw IOException("VPN is not connected")
             var last: IOException? = null
             // Like the browser: if a server fails, try the next one in the chain.
-            for (s in servers.take(3)) {
+            for (ep in eps.take(3)) {
                 try {
-                    return ProxyDialer.open(s, host, port, 8000)
+                    return ProxyDialer.open(ep, host, port, 8000)
                 } catch (e: ProxyDeadException) {
                     last = e
                     noteFailure()
@@ -405,6 +674,19 @@ object Core {
         }
     }
 
+    /** Where auto mode gets servers from. */
+    fun setSource(source: String) {
+        if (_state.value.prefs.source == source) return
+        val p = savePrefs { it.copy(source = source, selected = "auto") }
+        setStatus { it.copy(warning = "", error = "") }
+        bg {
+            // Make sure the new source has servers, then move the connection over.
+            if (p.usesFree && _state.value.free.none { it.ms != null }) refreshFreeAsync()
+            if (p.usesProxio && _state.value.proxio.none { it.ms != null }) runCatching { refreshProxio() }
+            if (_state.value.on) repick()
+        }
+    }
+
     fun select(id: String) {
         savePrefs { it.copy(selected = id) }
         setStatus { it.copy(warning = "", error = "") }
@@ -443,45 +725,57 @@ object Core {
     fun clearError() = setStatus { it.copy(error = "", warning = "") }
 
     // =====================================================================
-    // Your own servers (optional)
+    // Your own servers (VLESS, VMess, Trojan, Shadowsocks, SOCKS5, HTTP)
     // =====================================================================
 
-    class ImportResult(val added: Int, val skipped: Int)
+    class ImportResult(val added: Int, val skipped: Int, val core: Int, val switched: Boolean)
 
     private fun importText(text: String, source: Source): ImportResult {
         val parsed = Links.parse(text, source.id)
-        if (parsed.servers.isEmpty()) {
-            throw IOException(
-                if (parsed.skipped > 0) "These servers use VLESS / VMess / Trojan / Shadowsocks, which the Android app doesn't support yet. SOCKS5 and HTTP servers work."
-                else "No usable servers found in this text."
-            )
-        }
+        if (parsed.servers.isEmpty()) throw IOException("No usable servers found in this text.")
+        val core = parsed.servers.count { it.isCore }
+        if (core > 0 && !xrayIncluded && core == parsed.servers.size) throw IOException(XRAY_MISSING)
         val own = _state.value.own.filter { it.sourceId != source.id } + parsed.servers
         val sources = _state.value.sources.filter { it.id != source.id } + source.copy(
             name = source.name.ifBlank { parsed.title ?: runCatching { URL(source.url).host }.getOrDefault("Imported list") },
             count = parsed.servers.size, skipped = parsed.skipped, updatedAt = System.currentTimeMillis(),
         )
-        update { it.copy(own = own, sources = sources) }
-        store.saveOwnServers(own)
+        saveOwn(own)
+        update { it.copy(sources = sources) }
         store.saveSources(sources)
-        // Test them right away so they can be used.
-        bg { testOwn(parsed.servers) }
-        return ImportResult(parsed.servers.size, parsed.skipped)
+        // Use them: switch the server source, then test them so the fastest is picked.
+        val switched = _state.value.prefs.source != Prefs.SOURCE_OWN
+        if (switched) savePrefs { it.copy(source = Prefs.SOURCE_OWN, selected = "auto") }
+        bg {
+            testOwn(parsed.servers)
+            if (_state.value.on && _state.value.prefs.source == Prefs.SOURCE_OWN) repick()
+        }
+        return ImportResult(parsed.servers.size, parsed.skipped, core, switched)
     }
 
+    private val testingOwn = AtomicInteger()
+
     private fun testOwn(list: List<Server>) {
-        val res = HashMap<String, ProxyTester.Result?>()
-        ProxyTester.testMany(list, threads = 32) { s, r -> res[s.id] = r }
-        val now = System.currentTimeMillis()
-        update { st ->
-            st.copy(own = st.own.map { s ->
-                if (!res.containsKey(s.id)) s else {
-                    val r = res[s.id]
-                    s.copy(ms = r?.ms, code = r?.code?.ifEmpty { s.code } ?: s.code, testedAt = now)
-                }
-            })
+        if (list.isEmpty()) return
+        testingOwn.incrementAndGet()
+        update { it.copy(ownTesting = true) }
+        try {
+            val res = HashMap<String, ProxyTester.Result?>()
+            testServers(list, threads = 32) { s, r -> res[s.id] = r }
+            val now = System.currentTimeMillis()
+            update { st ->
+                st.copy(own = st.own.map { s ->
+                    if (!res.containsKey(s.id)) s else {
+                        val r = res[s.id]
+                        s.copy(ms = r?.ms, code = r?.code?.ifEmpty { s.code } ?: s.code, testedAt = now)
+                    }
+                })
+            }
+            store.saveOwnServers(_state.value.own)
+        } finally {
+            val left = testingOwn.decrementAndGet()
+            update { it.copy(ownTesting = left > 0) }
         }
-        store.saveOwnServers(_state.value.own)
     }
 
     fun importPasted(text: String): ImportResult =
@@ -494,22 +788,41 @@ object Core {
 
     private fun refreshListUrls() {
         for (src in _state.value.sources.filter { it.type == "url" }) {
-            runCatching { importText(FreeProxies.download(src.url, 20_000), src) }
+            runCatching {
+                val parsed = Links.parse(FreeProxies.download(src.url, 20_000), src.id)
+                if (parsed.servers.isNotEmpty()) {
+                    // Keep test results for servers that are still in the list.
+                    val old = _state.value.own.associateBy { it.id }
+                    val fresh = parsed.servers.map { s -> old[s.id]?.let { o -> s.copy(ms = o.ms, testedAt = o.testedAt, code = o.code.ifEmpty { s.code }) } ?: s }
+                    saveOwn(_state.value.own.filter { it.sourceId != src.id } + fresh)
+                    val sources = _state.value.sources.map { if (it.id == src.id) it.copy(count = fresh.size, skipped = parsed.skipped, updatedAt = System.currentTimeMillis()) else it }
+                    update { it.copy(sources = sources) }
+                    store.saveSources(sources)
+                }
+            }
         }
     }
 
     fun removeSource(id: String) {
         val own = _state.value.own.filter { it.sourceId != id }
         val sources = _state.value.sources.filter { it.id != id }
-        update { it.copy(own = own, sources = sources) }
-        store.saveOwnServers(own)
+        saveOwn(own)
+        update { it.copy(sources = sources) }
         store.saveSources(sources)
         if (_state.value.prefs.selected != "auto" && _state.value.servers.none { it.id == _state.value.prefs.selected }) select("auto")
+        if (own.isEmpty() && _state.value.prefs.source == Prefs.SOURCE_OWN) setSource(Prefs.SOURCE_FREE)
     }
 
+    /** The "Find fastest servers" button: re-test the current source. */
     fun testAll() = bg {
-        if (_state.value.own.isNotEmpty()) testOwn(_state.value.own)
-        refreshFree(force = true)
+        val p = _state.value.prefs
+        when (p.source) {
+            Prefs.SOURCE_OWN -> testOwn(_state.value.own)
+            Prefs.SOURCE_PROXIO -> runCatching { refreshProxio() }
+            Prefs.SOURCE_BOTH -> { runCatching { refreshProxio() }; refreshFree(force = true) }
+            else -> refreshFree(force = true)
+        }
+        if (_state.value.on && p.selected == "auto") repick()
     }
 
     // =====================================================================
@@ -519,14 +832,14 @@ object Core {
     fun checkIp() = bg {
         update { it.copy(ipText = "Checking your IP…") }
         val text = try {
-            val servers = chain
-            val body = if (_state.value.on && servers.isNotEmpty()) {
+            val eps = chainEndpoints
+            val body = if (_state.value.on && eps.isNotEmpty()) {
                 // Our own app is outside the VPN, so ask through the VPN server explicitly.
                 var result: String? = null
                 var err: Exception? = null
-                for (s in servers.take(3)) {
+                for (ep in eps.take(3)) {
                     try {
-                        result = ProxyTester.httpsGet(ProxyDialer.open(s, IP_CHECK_HOST, 443), IP_CHECK_HOST, "/")
+                        result = ProxyTester.httpsGet(ProxyDialer.open(ep, IP_CHECK_HOST, 443), IP_CHECK_HOST, "/")
                         break
                     } catch (e: Exception) { err = e }
                 }

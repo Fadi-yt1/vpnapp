@@ -20,6 +20,17 @@ class Store(context: Context) {
     fun sources(): List<Source> = arr("sources")?.let { a -> List(a.length()) { Source.fromJson(a.getJSONObject(it)) } } ?: emptyList()
     fun saveSources(l: List<Source>) = put("sources", JSONArray(l.map { it.toJson() }).toString())
 
+    fun proxioServers(): List<Server> = servers("proxioServers")
+    fun saveProxioServers(l: List<Server>) = put("proxioServers", JSONArray(l.map { it.toJson() }).toString())
+
+    fun proxioConfig(): Proxio.Config = Proxio.Config.fromJson(obj("proxio"))
+    fun saveProxioConfig(c: Proxio.Config) = put("proxio", c.toJson().toString())
+
+    fun proxioStatus(): ProxioStatus = ProxioStatus.fromJson(obj("proxioStatus"))
+    fun saveProxioStatus(s: ProxioStatus) = put("proxioStatus", s.toJson().toString())
+
+    fun removeProxio() = sp.edit().remove("proxio").remove("proxioServers").remove("proxioStatus").apply()
+
     fun freeStatus(): FreeStatus = FreeStatus.fromJson(obj("freeStatus"))
     fun saveFreeStatus(f: FreeStatus) = put("freeStatus", f.toJson().toString())
 

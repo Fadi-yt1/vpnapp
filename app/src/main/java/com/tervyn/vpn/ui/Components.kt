@@ -126,6 +126,7 @@ fun Field(
     singleLine: Boolean = true,
     minLines: Int = 1,
     leading: ImageVector? = null,
+    password: Boolean = false,
     keyboardOptions: androidx.compose.foundation.text.KeyboardOptions = androidx.compose.foundation.text.KeyboardOptions.Default,
     keyboardActions: androidx.compose.foundation.text.KeyboardActions = androidx.compose.foundation.text.KeyboardActions.Default,
 ) {
@@ -136,6 +137,8 @@ fun Field(
         leadingIcon = if (leading != null) { { Icon(leading, null, tint = C.muted, modifier = Modifier.size(18.dp)) } } else null,
         shape = RoundedCornerShape(12.dp),
         keyboardOptions = keyboardOptions, keyboardActions = keyboardActions,
+        visualTransformation = if (password) androidx.compose.ui.text.input.PasswordVisualTransformation()
+            else androidx.compose.ui.text.input.VisualTransformation.None,
         colors = OutlinedTextFieldDefaults.colors(
             focusedContainerColor = C.inputBg, unfocusedContainerColor = C.inputBg,
             focusedBorderColor = C.accent, unfocusedBorderColor = C.border,
@@ -207,8 +210,36 @@ fun ServerRow(s: Server?, selected: Boolean, onClick: () -> Unit) {
     }
 }
 
-fun serverSub(s: Server) =
-    if (s.free) "Free · ${s.proto.uppercase()} · ${s.hostPort}" else "Yours · ${s.proto.uppercase()} · ${s.hostPort}"
+fun serverSub(s: Server): String {
+    val kind = when {
+        s.free -> "Free"
+        s.isProxio -> "Proxio.io"
+        else -> "Yours"
+    }
+    val proto = if (s.isCore) {
+        val name = if (s.proto == "shadowsocks") "SS" else s.proto.uppercase()
+        val t = com.tervyn.vpn.core.Links.spec(s.link)?.transport
+        if (t != null) "$name · $t" else name
+    } else s.proto.uppercase()
+    return "$kind · $proto · ${s.hostPort}"
+}
+
+/** A card that opens a menu of choices. */
+@Composable
+fun OptionPicker(value: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        CardRow(onClick = { open = true }) {
+            Text(options.firstOrNull { it.first == value }?.second ?: value, color = C.text, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+            Icon(TIcons.down, null, tint = C.muted, modifier = Modifier.size(18.dp))
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            for ((key, label) in options) {
+                DropdownMenuItem(text = { Text(label) }, onClick = { open = false; onSelect(key) })
+            }
+        }
+    }
+}
 
 /** A card that opens a menu of countries. value = "" means any / fastest. */
 @Composable

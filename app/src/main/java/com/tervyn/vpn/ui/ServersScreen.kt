@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tervyn.vpn.core.AppState
 import com.tervyn.vpn.core.Core
+import com.tervyn.vpn.core.Prefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -39,7 +40,14 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
     var country by rememberSaveable { mutableStateOf("") }
     var showAll by remember { mutableStateOf(false) }
     val fs = st.freeStatus
-    val busy = fs.busy || Core.isRefreshing
+    val ps = st.proxioStatus
+    val src = st.prefs.source
+    val busy = when (src) {
+        Prefs.SOURCE_OWN -> st.ownTesting
+        Prefs.SOURCE_PROXIO -> ps.busy
+        Prefs.SOURCE_BOTH -> ps.busy || fs.busy
+        else -> fs.busy
+    }
 
     val list = st.servers.distinctBy { it.id }
         .filter { country.isEmpty() || it.code == country }
@@ -59,19 +67,37 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
             CountryPicker(country, countryList(st), "All countries") { country = it }
         }
         item {
-            PrimaryButton(if (busy) "Searching…" else "Find fastest free servers", Modifier.fillMaxWidth().padding(top = 4.dp), enabled = !busy) {
+            PrimaryButton(if (busy) "Testing…" else "Find fastest servers", Modifier.fillMaxWidth().padding(top = 4.dp), enabled = !busy) {
                 Core.testAll()
             }
         }
         item {
+            val freeLine = when {
+                fs.state == "loading" -> "Downloading free server lists…"
+                fs.state == "testing" -> "Testing free servers… ${fs.progress}% · ${fs.working} working so far"
+                fs.error.isNotEmpty() -> fs.error
+                fs.at > 0 -> "${st.free.count { it.ms != null }} fast free servers ready (checked ${fs.found}). " +
+                    "Updated ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(fs.at))} · refreshes every 30 min."
+                else -> "Free servers are being prepared…"
+            }
+            val proxioLine = when {
+                st.proxioConfig.key.isBlank() -> "Add your Proxio.io API key in Settings."
+                ps.state == "loading" -> "Downloading your Proxio.io list…"
+                ps.state == "testing" -> "Testing ${ps.fetched} Proxio.io servers…"
+                ps.error.isNotEmpty() -> ps.error
+                else -> "${st.proxio.count { it.ms != null }} of ${ps.fetched} Proxio.io servers working."
+            }
+            val ownLine = when {
+                st.own.isEmpty() -> "Source: your own servers. Add them below."
+                st.ownTesting -> "Testing your servers…"
+                else -> "${st.own.count { it.ms != null }} of ${st.own.size} of your servers working."
+            }
             Muted(
-                when {
-                    fs.state == "loading" -> "Downloading free server lists…"
-                    fs.state == "testing" -> "Testing free servers… ${fs.progress}% · ${fs.working} working so far"
-                    fs.error.isNotEmpty() -> fs.error
-                    fs.at > 0 -> "${st.free.count { it.ms != null }} fast free servers ready (checked ${fs.found}). " +
-                        "Updated ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(fs.at))} · refreshes every 30 min."
-                    else -> "Free servers are being prepared…"
+                when (src) {
+                    Prefs.SOURCE_OWN -> ownLine
+                    Prefs.SOURCE_PROXIO -> proxioLine
+                    Prefs.SOURCE_BOTH -> "$proxioLine\n$freeLine"
+                    else -> freeLine
                 },
                 Modifier.fillMaxWidth().padding(vertical = 6.dp), center = true,
             )
@@ -106,7 +132,9 @@ private fun OwnServers(st: AppState) {
             msg = try {
                 val r = withContext(Dispatchers.IO) { work() }
                 after()
-                "Added ${r.added} servers" + (if (r.skipped > 0) " (${r.skipped} VLESS/VMess/Trojan skipped — not supported on Android yet)" else "") + "."
+                "Added ${r.added} servers" + (if (r.core > 0) " (${r.core} VLESS / VMess / Trojan / SS)" else "") +
+                    (if (r.skipped > 0) ", ${r.skipped} skipped (unsupported settings)" else "") + ". " +
+                    (if (r.switched) "Server source switched to \"Your own servers\". " else "") + "Testing them now…"
             } catch (e: Exception) {
                 e.message ?: e.toString()
             }
@@ -122,14 +150,14 @@ private fun OwnServers(st: AppState) {
         }
         if (open) {
             Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Muted("Not needed — free servers are found automatically. SOCKS5 and HTTP servers work here; VLESS / VMess / Trojan need Xray and aren't supported in the Android app yet.")
+                Muted("Optional. Paste share links or a subscription link: VLESS, VMess, Trojan, Shadowsocks (through the built-in Xray core), SOCKS5 and HTTP. Imported servers are tested, and the fastest is used when Server source is \"Your own servers\".")
                 SectionLabel("Server list link (refreshes every 30 min)")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Field(url, { url = it }, "https://…", Modifier.weight(1f))
                     PrimaryButton("Add", enabled = url.isNotBlank()) { val u = url.trim(); run({ Core.addListUrl(u) }) { url = "" } }
                 }
                 SectionLabel("Or paste servers")
-                Field(paste, { paste = it }, "socks5://user:pass@1.2.3.4:1080\nhttp://5.6.7.8:8080", Modifier.fillMaxWidth(), singleLine = false, minLines = 3)
+                Field(paste, { paste = it }, "vless://…  vmess://…  trojan://…  ss://…  socks5://…", Modifier.fillMaxWidth(), singleLine = false, minLines = 3)
                 GhostButton("Import text", Modifier.fillMaxWidth()) {
                     val t = paste
                     if (t.isNotBlank()) run({ Core.importPasted(t) }) { paste = "" }

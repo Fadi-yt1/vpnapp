@@ -20,7 +20,9 @@ The same as the extension, for every app on your phone:
 - **Choose a country**, or keep "Fastest available".
 - **Check my IP** shows the address and country websites see.
 - **Quick Settings tile** to connect with one tap, plus support for Android's **Always-on VPN** and **Block connections without VPN**.
-- **Your own servers (optional):** add a list link or paste `socks5://` / `http://` servers (with or without a login).
+- **Server source** (Settings): *Free public servers*, *Proxio.io servers (your API key)*, *Proxio.io + free servers*, or *Your own servers*.
+- **Proxio.io:** paste your API key in Settings, choose SOCKS5, HTTP or both and how many servers, and tap **Save & load**. Tervyn downloads your list (`https://proxio.io/api/list?type=…&limit=…` with the `X-Key` header), tests every server and switches the source to Proxio.io. The key is stored only on your phone and sent only to proxio.io. Unlike Chrome, the app can also use SOCKS5 servers that need a password.
+- **Your own servers, including VLESS:** paste share links or add a subscription link under **Servers → Advanced**. Supported: **VLESS** (TCP, REALITY, Vision, WebSocket, gRPC, XHTTP, HTTPUpgrade), **VMess**, **Trojan**, **Shadowsocks**, SOCKS5 and HTTP. VLESS and the other share-link types run through the **Xray-core** included in the app; no helper app needed.
 
 ## Get the APK
 
@@ -28,7 +30,7 @@ Every push builds the app on GitHub:
 
 1. Open the repository's **Actions** tab → **Build Android APK** → the latest run.
 2. Download the **tervyn-vpn-apk** artifact and unzip it.
-3. Copy `app-release.apk` to your phone and open it. Allow "install unknown apps" if Android asks.
+3. Copy **`app-arm64-v8a-release.apk`** to your phone and open it (almost all phones from the last few years). If it says the app isn't compatible, use `app-universal-release.apk`. Allow "install unknown apps" if Android asks.
 
 The release APK is signed with a debug key so it installs right away. Before publishing on Google Play, create your own signing key and set it in `app/build.gradle.kts`.
 
@@ -55,10 +57,20 @@ apps ──► Android VPN (Tervyn) ──► fastest free server (+ backups) �
 - `net/ProxyTester.kt` runs the HTTPS test on Cloudflare's trace page, 64 servers at a time.
 - `core/Core.kt` does the job of `background.js` in the extension: finding servers, choosing the fastest, health checks and failover.
 - `ui/` is the Jetpack Compose interface, in the same design as the extension popup.
+- `core/Proxio.kt` downloads your Proxio.io list and reads any response shape: JSON objects, JSON strings or plain `host:port:user:pass` lines.
+- `core/Links.kt` reads share links. `xray/XrayConfig.kt` turns them into an Xray config, and `xray/XrayProcess.kt` runs Xray.
+  - Each of your VLESS / VMess / Trojan / Shadowsocks servers gets its own local SOCKS5 port on `127.0.0.1`, protected by a random password so other apps can't use it.
+  - The VPN engine then uses those ports like any other proxy, so failover, health checks and speed tests work the same.
+  - Servers are tested through a temporary Xray before use.
+
+### Xray-core
+
+The build downloads the official [Xray-core](https://github.com/XTLS/Xray-core) release (currently `v26.9.30`, set in `app/build.gradle.kts`) for each phone type. It checks the download against the release's SHA-256 digest and packages it as `libxray.so`. Xray-core is licensed under MPL-2.0.
+
+Old share links with `allowInsecure=1` are still accepted. Current Xray versions removed that option, so certificates are checked normally. To trust a self-signed server, add its certificate's SHA-256 as `pcs=` to the link (Xray's `pinnedPeerCertSha256`).
 
 ## Limits
 
-- **VLESS / VMess / Trojan / Shadowsocks** servers need Xray-core, which the Android app doesn't include yet. They're skipped when importing. Free servers and your own SOCKS5/HTTP servers work.
 - **UDP traffic** (such as video calls, some games and QUIC) can't go through free SOCKS/HTTP proxies. In "All apps" mode it's blocked, and most apps then fall back to TCP automatically. In "Only my sites" mode, everything not on your list uses your normal connection.
 - **IPv6** is blocked in "All apps" mode so nothing leaks around the VPN. Sites are reached over IPv4.
 - If Android's **Private DNS** is set to a specific provider, apps skip Tervyn's DNS. "All apps" mode still works, but "Only my sites" can't see the site names. Set Private DNS to Automatic or Off.

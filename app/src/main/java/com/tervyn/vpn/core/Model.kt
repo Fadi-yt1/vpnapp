@@ -20,7 +20,11 @@ data class Server(
     val score: Int = 0,
     val ms: Int? = null,        // last measured delay, null = not working / untested
     val testedAt: Long = 0,
+    val link: String = "",      // share link, for VLESS / VMess / Trojan / Shadowsocks servers
 ) : ProxyEndpoint {
+    /** Needs Xray (VLESS, VMess, Trojan, Shadowsocks). Plain SOCKS5 / HTTP servers don't. */
+    val isCore: Boolean get() = proto in CORE_PROTOS
+    val isProxio: Boolean get() = sourceId == PROXIO_SOURCE
     val flag: String get() = flagFromCode(code)
     val country: String get() = countryName(code)
     val hostPort: String get() = "$address:$port"
@@ -31,6 +35,7 @@ data class Server(
         put("free", free); put("sourceId", sourceId); put("score", score)
         if (ms != null) put("ms", ms)
         put("testedAt", testedAt)
+        if (link.isNotEmpty()) put("link", link)
     }
 
     companion object {
@@ -40,7 +45,11 @@ data class Server(
             code = o.optString("code"), name = o.optString("name"), free = o.optBoolean("free", true),
             sourceId = o.optString("sourceId", "free"), score = o.optInt("score"),
             ms = if (o.has("ms")) o.getInt("ms") else null, testedAt = o.optLong("testedAt"),
+            link = o.optString("link"),
         )
+
+        val CORE_PROTOS = setOf("vless", "vmess", "trojan", "shadowsocks")
+        const val PROXIO_SOURCE = "proxio"
 
         fun make(
             proto: String, address: String, port: Int, code: String = "", source: String = "free",
@@ -64,17 +73,25 @@ data class Prefs(
     val sites: List<String> = emptyList(),
     val autoPool: Int = 5,              // servers kept ready (first one + backups)
     val country: String = "",           // limit auto mode to one country code ("" = any)
+    val source: String = SOURCE_FREE,   // where auto mode gets servers from
 ) {
     val targeted get() = mode == MODE_TARGETED
+    val usesFree get() = source == SOURCE_FREE || source == SOURCE_BOTH
+    val usesProxio get() = source == SOURCE_PROXIO || source == SOURCE_BOTH
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("enabled", enabled); put("mode", mode); put("selected", selected)
         put("sites", JSONArray(sites)); put("autoPool", autoPool); put("country", country)
+        put("source", source)
     }
 
     companion object {
         const val MODE_FULL = "full"
         const val MODE_TARGETED = "targeted"
+        const val SOURCE_FREE = "free"       // free public servers
+        const val SOURCE_PROXIO = "proxio"   // Proxio.io (your API key)
+        const val SOURCE_BOTH = "both"       // Proxio.io + free
+        const val SOURCE_OWN = "own"         // your own servers (VLESS, VMess, Trojan, SS, SOCKS, HTTP)
         fun fromJson(o: JSONObject?): Prefs {
             if (o == null) return Prefs()
             val sites = o.optJSONArray("sites")?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList()
@@ -82,6 +99,7 @@ data class Prefs(
                 enabled = o.optBoolean("enabled"), mode = o.optString("mode", MODE_FULL),
                 selected = o.optString("selected", "auto"), sites = sites,
                 autoPool = o.optInt("autoPool", 5), country = o.optString("country"),
+                source = o.optString("source", SOURCE_FREE),
             )
         }
     }
@@ -137,16 +155,42 @@ data class FreeStatus(
     }
 }
 
+/** Loading / testing state of the Proxio.io list. */
+data class ProxioStatus(
+    val state: String = "idle",         // idle, loading, testing
+    val at: Long = 0,
+    val fetched: Int = 0,
+    val working: Int = 0,
+    val error: String = "",
+) {
+    val busy get() = state == "loading" || state == "testing"
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("at", at); put("fetched", fetched); put("working", working); put("error", error)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject?) = if (o == null) ProxioStatus() else ProxioStatus(
+            at = o.optLong("at"), fetched = o.optInt("fetched"), working = o.optInt("working"), error = o.optString("error"),
+        )
+    }
+}
+
 data class AppState(
     val prefs: Prefs = Prefs(),
     val status: Status = Status(),
     val free: List<Server> = emptyList(),
     val own: List<Server> = emptyList(),
+    val proxio: List<Server> = emptyList(),
+    val proxioConfig: Proxio.Config = Proxio.Config(),
+    val proxioStatus: ProxioStatus = ProxioStatus(),
     val sources: List<Source> = emptyList(),
     val freeStatus: FreeStatus = FreeStatus(),
     val ipText: String = "",
+    val xrayVersion: String = "",       // "" = Xray isn't included in this build
+    val ownTesting: Boolean = false,    // your own servers are being tested
 ) {
-    val servers: List<Server> get() = free + own
+    val servers: List<Server> get() = (proxio + free + own).distinctBy { it.id }
     val on: Boolean get() = prefs.enabled && status.state == "on"
     val connecting: Boolean get() = status.state == "connecting"
 }

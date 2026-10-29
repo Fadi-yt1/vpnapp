@@ -92,6 +92,7 @@ data class Prefs(
         const val SOURCE_PROXIO = "proxio"   // Proxio.io (your API key)
         const val SOURCE_BOTH = "both"       // Proxio.io + free
         const val SOURCE_OWN = "own"         // your own servers (VLESS, VMess, Trojan, SS, SOCKS, HTTP)
+        const val SOURCE_CUSTOM = "custom"   // proxy integration: pasted curl / Python / Node.js code
         fun fromJson(o: JSONObject?): Prefs {
             if (o == null) return Prefs()
             val sites = o.optJSONArray("sites")?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList()
@@ -184,13 +185,16 @@ data class AppState(
     val proxio: List<Server> = emptyList(),
     val proxioConfig: Proxio.Config = Proxio.Config(),
     val proxioStatus: ProxioStatus = ProxioStatus(),
+    val custom: List<Server> = emptyList(),        // proxies from your pasted integration code
+    val customCode: String = "",
+    val customStatus: ProxioStatus = ProxioStatus(),
     val sources: List<Source> = emptyList(),
     val freeStatus: FreeStatus = FreeStatus(),
     val ipText: String = "",
     val xrayVersion: String = "",       // "" = Xray isn't included in this build
     val ownTesting: Boolean = false,    // your own servers are being tested
 ) {
-    val servers: List<Server> get() = (proxio + free + own).distinctBy { it.id }
+    val servers: List<Server> get() = (custom + proxio + free + own).distinctBy { it.id }
     val on: Boolean get() = prefs.enabled && status.state == "on"
     val connecting: Boolean get() = status.state == "connecting"
 }

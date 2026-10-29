@@ -20,7 +20,12 @@ The same as the extension, for every app on your phone:
 - **Choose a country**, or keep "Fastest available".
 - **Check my IP** shows the address and country websites see.
 - **Quick Settings tile** to connect with one tap, plus support for Android's **Always-on VPN** and **Block connections without VPN**.
-- **Server source** (Settings): *Free public servers*, *Proxio.io servers (your API key)*, *Proxio.io + free servers*, or *Your own servers*.
+- **Server source** (Settings): *Free public servers*, *Proxio.io servers (your API key)*, *Proxio.io + free servers*, *Your own servers*, or *Proxy integration*.
+- **Proxy integration (curl / Python / Node.js):** paste the code example your proxy provider gives you (Webshare, Bright Data, Oxylabs, IPRoyal…), for example `curl --proxy "http://USER:PASS@1.2.3.4:6014/" https://ipv4.webshare.io/`, and tap **Save & test**. Tervyn finds the proxy address and login, tests it and uses it. It understands:
+  - curl `--proxy` / `-x` / `-U` / `--socks5`
+  - Python `proxies={...}`, including f-strings and variables
+  - Node.js axios `proxy: { host, port, auth }`, `HttpsProxyAgent` / `SocksProxyAgent`
+  - plain `host:port:user:pass` lists
 - **Proxio.io:** paste your API key in Settings, choose SOCKS5, HTTP or both and how many servers, and tap **Save & load**. Tervyn downloads your list (`https://proxio.io/api/list?type=…&limit=…` with the `X-Key` header), tests every server and switches the source to Proxio.io. The key is stored only on your phone and sent only to proxio.io. Unlike Chrome, the app can also use SOCKS5 servers that need a password.
 - **Your own servers, including VLESS:** paste share links or add a subscription link under **Servers → Advanced**. Supported: **VLESS** (TCP, REALITY, Vision, WebSocket, gRPC, XHTTP, HTTPUpgrade), **VMess**, **Trojan**, **Shadowsocks**, SOCKS5 and HTTP. VLESS and the other share-link types run through the **Xray-core** included in the app; no helper app needed.
 
@@ -57,6 +62,7 @@ apps ──► Android VPN (Tervyn) ──► fastest free server (+ backups) �
 - `net/ProxyTester.kt` runs the HTTPS test on Cloudflare's trace page, 64 servers at a time.
 - `core/Core.kt` does the job of `background.js` in the extension: finding servers, choosing the fastest, health checks and failover.
 - `ui/` is the Jetpack Compose interface, in the same design as the extension popup.
+- `core/ProxySnippet.kt` reads proxies out of pasted curl / Python / Node.js code.
 - `core/Proxio.kt` downloads your Proxio.io list and reads any response shape: JSON objects, JSON strings or plain `host:port:user:pass` lines.
 - `core/Links.kt` reads share links. `xray/XrayConfig.kt` turns them into an Xray config, and `xray/XrayProcess.kt` runs Xray.
   - Each of your VLESS / VMess / Trojan / Shadowsocks servers gets its own local SOCKS5 port on `127.0.0.1`, protected by a random password so other apps can't use it.

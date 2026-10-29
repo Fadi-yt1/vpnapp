@@ -80,6 +80,7 @@ object Core {
         _state.value = AppState(
             prefs = store.prefs(), free = store.freeServers(), own = store.ownServers(),
             proxio = store.proxioServers(), proxioConfig = store.proxioConfig(), proxioStatus = store.proxioStatus(),
+            custom = store.customServers(), customCode = store.customCode(), customStatus = store.customStatus(),
             sources = store.sources(), freeStatus = store.freeStatus(),
         )
         xrayBin = File(app.applicationInfo.nativeLibraryDir, "libxray.so").takeIf { it.exists() }
@@ -148,6 +149,7 @@ object Core {
         if (p.usesProxio) runCatching { refreshProxio() }
         if (p.usesFree) refreshFree(force = true)
         if (p.source == Prefs.SOURCE_OWN) testOwn(_state.value.own)
+        if (p.source == Prefs.SOURCE_CUSTOM) runCatching { testCustom() }
     }
 
     // =====================================================================
@@ -349,6 +351,73 @@ object Core {
     }
 
     // =====================================================================
+    // Proxy integration (pasted curl / Python / Node.js code)
+    // =====================================================================
+
+    private fun saveCustom(list: List<Server>) {
+        update { it.copy(custom = list) }
+        store.saveCustomServers(list)
+    }
+
+    private fun setCustomStatus(st: ProxioStatus) {
+        update { it.copy(customStatus = st) }
+        store.saveCustomStatus(st)
+    }
+
+    /** Reads the proxies from [code], tests them and switches to them if one works. */
+    fun customSave(code: String): ProxioStatus {
+        val parsed = ProxySnippet.parse(code)
+        if (parsed.servers.isEmpty()) {
+            throw IOException(
+                if (parsed.unsupported > 0) "This code uses a SOCKS4 proxy, which isn't supported. Use the HTTP or SOCKS5 example from your provider."
+                else "Couldn't find a proxy in this code. Paste the curl, Python or Node.js example from your proxy provider: it should include the proxy address, like http://user:pass@host:port."
+            )
+        }
+        update { it.copy(customCode = code) }
+        store.saveCustomCode(code)
+        saveCustom(parsed.servers)
+        val st = testCustom()
+        if (st.working > 0 && _state.value.prefs.source != Prefs.SOURCE_CUSTOM) setSource(Prefs.SOURCE_CUSTOM)
+        else if (st.working > 0 && _state.value.on) repick()
+        return st
+    }
+
+    private val customLock = Any()
+
+    /** Tests the integration proxies (keeps them all, with their result). */
+    fun testCustom(): ProxioStatus {
+        synchronized(customLock) {
+            val list = _state.value.custom
+            if (list.isEmpty()) return _state.value.customStatus
+            setCustomStatus(_state.value.customStatus.copy(state = "testing", fetched = list.size, error = ""))
+            val res = HashMap<String, ProxyTester.Result?>()
+            testServers(list, threads = 16) { s, r -> res[s.id] = r }
+            val now = System.currentTimeMillis()
+            val tested = _state.value.custom.map { s ->
+                val r = res[s.id]
+                s.copy(ms = r?.ms, code = r?.code?.ifEmpty { s.code } ?: s.code, testedAt = now)
+            }
+            saveCustom(tested)
+            val working = tested.count { it.ms != null }
+            val st = ProxioStatus(
+                at = now, fetched = tested.size, working = working,
+                error = if (working == 0) {
+                    if (tested.size == 1) "The proxy didn't answer the speed test. Check the address, the login and that your plan is active."
+                    else "None of the ${tested.size} proxies answered the speed test. Check the login and that your plan is active."
+                } else "",
+            )
+            setCustomStatus(st)
+            return st
+        }
+    }
+
+    fun customRemove() {
+        store.removeCustom()
+        update { it.copy(custom = emptyList(), customCode = "", customStatus = ProxioStatus()) }
+        if (_state.value.prefs.source == Prefs.SOURCE_CUSTOM) setSource(Prefs.SOURCE_FREE)
+    }
+
+    // =====================================================================
     // Health checks
     // =====================================================================
 
@@ -379,6 +448,7 @@ object Core {
             saveFree(upd(_state.value.free, dropDead = true))
             saveProxio(upd(_state.value.proxio, dropDead = true))
             saveOwn(upd(_state.value.own, dropDead = false))
+            saveCustom(upd(_state.value.custom, dropDead = false))
             if (dead.isNotEmpty() && !connecting && refreshing == null) {
                 if (inUse.first().id in dead) {
                     setStatus {
@@ -416,6 +486,18 @@ object Core {
         fun best(l: List<Server>) = inCountry(l.filter { it.ms != null }).sortedBy { it.ms }.take(maxOf(2, prefs.autoPool))
 
         when (prefs.source) {
+            Prefs.SOURCE_CUSTOM -> {
+                var list = best(_state.value.custom)
+                if (list.isEmpty()) {
+                    if (_state.value.custom.isEmpty()) {
+                        throw IOException("Paste your proxy's curl, Python or Node.js example under Settings → Proxy integration, or choose another server source.")
+                    }
+                    runCatching { testCustom() }
+                    list = best(_state.value.custom)
+                }
+                if (list.isEmpty()) throw IOException(_state.value.customStatus.error.ifEmpty { "Your integration proxy isn't answering. Check the login and that your plan is active." })
+                return list
+            }
             Prefs.SOURCE_OWN -> {
                 var list = best(_state.value.own)
                 if (list.isEmpty()) {
@@ -817,6 +899,7 @@ object Core {
     fun testAll() = bg {
         val p = _state.value.prefs
         when (p.source) {
+            Prefs.SOURCE_CUSTOM -> runCatching { testCustom() }
             Prefs.SOURCE_OWN -> testOwn(_state.value.own)
             Prefs.SOURCE_PROXIO -> runCatching { refreshProxio() }
             Prefs.SOURCE_BOTH -> { runCatching { refreshProxio() }; refreshFree(force = true) }

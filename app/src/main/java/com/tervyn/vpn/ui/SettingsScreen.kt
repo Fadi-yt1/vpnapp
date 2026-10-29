@@ -38,6 +38,14 @@ val SOURCE_OPTIONS = listOf(
     Prefs.SOURCE_PROXIO to "Proxio.io servers (your API key)",
     Prefs.SOURCE_BOTH to "Proxio.io + free servers",
     Prefs.SOURCE_OWN to "Your own servers (VLESS, Trojan…)",
+    Prefs.SOURCE_CUSTOM to "Proxy integration (curl / Python / Node.js)",
+)
+
+/** Example code shown in the empty box (placeholders, not real logins). */
+private val INTEGRATION_EXAMPLES = mapOf(
+    "curl" to "curl --proxy \"http://USER:PASS@1.2.3.4:6014/\" https://ipv4.webshare.io/",
+    "python" to "import requests\nrequests.get(\"https://ipv4.webshare.io/\", proxies={\n  \"http\": \"http://USER:PASS@1.2.3.4:6014/\",\n  \"https\": \"http://USER:PASS@1.2.3.4:6014/\"})",
+    "node" to "axios.get('https://ipv4.webshare.io/', { proxy: {\n  protocol: 'http', host: '1.2.3.4', port: 6014,\n  auth: { username: 'USER', password: 'PASS' } } })",
 )
 
 @Composable
@@ -53,6 +61,8 @@ fun SettingsScreen(st: AppState) {
 
         VSpace(10)
         ProxioCard(st)
+        VSpace(10)
+        IntegrationCard(st)
 
         SectionLabel("Backup servers kept ready")
         Segmented(listOf("2", "3", "5", "8").map { it to "$it servers" }, st.prefs.autoPool.toString()) {
@@ -178,6 +188,92 @@ private fun ProxioCard(st: AppState) {
         if (line.first.isNotEmpty()) {
             VSpace(10)
             Text(line.first, color = line.second, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun IntegrationCard(st: AppState) {
+    val cs = st.customStatus
+    val has = st.custom.isNotEmpty()
+    var lang by rememberSaveable { mutableStateOf("curl") }
+    var code by rememberSaveable { mutableStateOf("") }
+    var msg by remember { mutableStateOf("") }
+    var running by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    fun launchWork(work: () -> String) {
+        msg = ""
+        running = true
+        scope.launch {
+            msg = try { withContext(Dispatchers.IO) { work() } } catch (e: Exception) { e.message ?: e.toString() }
+            running = false
+        }
+    }
+
+    Card {
+        Text("Proxy integration", color = C.text, fontWeight = FontWeight.SemiBold)
+        VSpace(2)
+        Muted("Paste the curl, Python or Node.js example from your proxy provider (Webshare, Bright Data, Oxylabs, IPRoyal…). Tervyn finds the proxy address and login in it. The code stays on this phone.")
+        VSpace(10)
+        Segmented(listOf("curl" to "curl", "python" to "Python", "node" to "Node.js"), lang) { lang = it }
+        VSpace(8)
+        Field(
+            code, { code = it },
+            if (has && code.isEmpty()) "Saved: ${st.custom.size} prox${if (st.custom.size == 1) "y" else "ies"}. Paste new code to replace.\n\nExample:\n${INTEGRATION_EXAMPLES[lang]}"
+            else "Example:\n${INTEGRATION_EXAMPLES[lang]}",
+            Modifier.fillMaxWidth(), singleLine = false, minLines = 4,
+        )
+        VSpace(10)
+        val busy = running || cs.busy
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PrimaryButton(if (busy) "Testing…" else "Save & test", Modifier.weight(1.4f), enabled = !busy && code.isNotBlank()) {
+                val c = code
+                launchWork {
+                    val r = Core.customSave(c)
+                    if (r.working > 0) "${r.working} of ${r.fetched} working. Server source is now \"Proxy integration\"." else r.error
+                }
+                code = ""
+            }
+            if (has) {
+                GhostButton("Re-test", Modifier.weight(1f)) {
+                    if (!busy) launchWork { Core.testCustom().let { r -> if (r.working > 0) "${r.working} of ${r.fetched} working." else r.error } }
+                }
+                GhostButton("Remove", Modifier.weight(1f), color = C.red) {
+                    if (!busy) { Core.customRemove(); code = ""; msg = "Removed." }
+                }
+            }
+        }
+        val line = when {
+            cs.state == "testing" -> "Testing ${cs.fetched} prox${if (cs.fetched == 1) "y" else "ies"}…" to C.muted
+            msg.isNotEmpty() -> msg to (if (st.custom.any { it.ms != null }) C.green else C.red)
+            cs.error.isNotEmpty() && has -> cs.error to C.red
+            has && cs.at > 0 -> "${cs.working} of ${cs.fetched} working · tested " +
+                DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(cs.at)) to C.green
+            else -> "" to C.muted
+        }
+        if (line.first.isNotEmpty()) {
+            VSpace(10)
+            Text(line.first, color = line.second, fontSize = 12.sp)
+        }
+        if (has) {
+            VSpace(8)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (s in st.custom) {
+                    CardRow {
+                        FlagBadge(s.flag, 30)
+                        Column(Modifier.weight(1f)) {
+                            Text("${s.proto.uppercase()} ${s.hostPort}", color = C.text, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            Muted(listOfNotNull(
+                                s.username.takeIf { it.isNotEmpty() }?.let { "login $it" },
+                                s.country.takeIf { it != "Unknown" },
+                            ).joinToString(" · ").ifEmpty { "no login" })
+                        }
+                        PingBadge(s.ms, s.testedAt > 0)
+                    }
+                }
+            }
         }
     }
 }

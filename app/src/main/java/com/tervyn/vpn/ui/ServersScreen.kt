@@ -43,6 +43,7 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
     val ps = st.proxioStatus
     val src = st.prefs.source
     val busy = when (src) {
+        Prefs.SOURCE_CUSTOM -> st.customStatus.busy
         Prefs.SOURCE_OWN -> st.ownTesting
         Prefs.SOURCE_PROXIO -> ps.busy
         Prefs.SOURCE_BOTH -> ps.busy || fs.busy
@@ -94,6 +95,11 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
             }
             Muted(
                 when (src) {
+                    Prefs.SOURCE_CUSTOM -> when {
+                        st.custom.isEmpty() -> "Paste your proxy's code under Settings → Proxy integration."
+                        st.customStatus.busy -> "Testing your integration proxies…"
+                        else -> "${st.custom.count { it.ms != null }} of ${st.custom.size} integration proxies working."
+                    }
                     Prefs.SOURCE_OWN -> ownLine
                     Prefs.SOURCE_PROXIO -> proxioLine
                     Prefs.SOURCE_BOTH -> "$proxioLine\n$freeLine"

@@ -44,6 +44,7 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
     val src = st.prefs.source
     val busy = when (src) {
         Prefs.SOURCE_CUSTOM -> st.customStatus.busy
+        Prefs.SOURCE_LIST -> st.listStatus.busy
         Prefs.SOURCE_OWN -> st.ownTesting
         Prefs.SOURCE_PROXIO -> ps.busy
         Prefs.SOURCE_BOTH -> ps.busy || fs.busy
@@ -95,6 +96,11 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
             }
             Muted(
                 when (src) {
+                    Prefs.SOURCE_LIST -> when {
+                        st.list.isEmpty() -> "Import your proxy list under Settings → Proxy list."
+                        st.listStatus.busy -> "Testing your proxy list…"
+                        else -> "${st.list.count { it.ms != null }} of ${st.list.size} proxies in your list working."
+                    }
                     Prefs.SOURCE_CUSTOM -> when {
                         st.custom.isEmpty() -> "Paste your proxy's code under Settings → Proxy integration."
                         st.customStatus.busy -> "Testing your integration proxies…"

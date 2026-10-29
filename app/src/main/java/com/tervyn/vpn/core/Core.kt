@@ -81,6 +81,7 @@ object Core {
             prefs = store.prefs(), free = store.freeServers(), own = store.ownServers(),
             proxio = store.proxioServers(), proxioConfig = store.proxioConfig(), proxioStatus = store.proxioStatus(),
             custom = store.customServers(), customCode = store.customCode(), customStatus = store.customStatus(),
+            list = store.listServers(), listName = store.listName(), listStatus = store.listStatus(),
             sources = store.sources(), freeStatus = store.freeStatus(),
         )
         xrayBin = File(app.applicationInfo.nativeLibraryDir, "libxray.so").takeIf { it.exists() }
@@ -150,6 +151,7 @@ object Core {
         if (p.usesFree) refreshFree(force = true)
         if (p.source == Prefs.SOURCE_OWN) testOwn(_state.value.own)
         if (p.source == Prefs.SOURCE_CUSTOM) runCatching { testCustom() }
+        if (p.source == Prefs.SOURCE_LIST) runCatching { testList() }
     }
 
     // =====================================================================
@@ -385,28 +387,41 @@ object Core {
     private val customLock = Any()
 
     /** Tests the integration proxies (keeps them all, with their result). */
-    fun testCustom(): ProxioStatus {
+    fun testCustom(): ProxioStatus = testKept({ it.custom }, ::saveCustom, { it.customStatus }, ::setCustomStatus)
+
+    /**
+     * Tests every proxy in a list you gave us and keeps them all with their
+     * result (dead ones stay, so they can come back later).
+     */
+    private fun testKept(
+        get: (AppState) -> List<Server>,
+        save: (List<Server>) -> Unit,
+        status: (AppState) -> ProxioStatus,
+        setStatus: (ProxioStatus) -> Unit,
+    ): ProxioStatus {
         synchronized(customLock) {
-            val list = _state.value.custom
-            if (list.isEmpty()) return _state.value.customStatus
-            setCustomStatus(_state.value.customStatus.copy(state = "testing", fetched = list.size, error = ""))
+            val list = get(_state.value)
+            if (list.isEmpty()) return status(_state.value)
+            setStatus(status(_state.value).copy(state = "testing", fetched = list.size, error = ""))
             val res = HashMap<String, ProxyTester.Result?>()
-            testServers(list, threads = 16) { s, r -> res[s.id] = r }
+            testServers(list, threads = 32) { s, r -> res[s.id] = r }
             val now = System.currentTimeMillis()
-            val tested = _state.value.custom.map { s ->
-                val r = res[s.id]
-                s.copy(ms = r?.ms, code = r?.code?.ifEmpty { s.code } ?: s.code, testedAt = now)
+            val tested = get(_state.value).map { s ->
+                if (!res.containsKey(s.id)) s else {
+                    val r = res[s.id]
+                    s.copy(ms = r?.ms, code = r?.code?.ifEmpty { s.code } ?: s.code, testedAt = now)
+                }
             }
-            saveCustom(tested)
+            save(tested)
             val working = tested.count { it.ms != null }
             val st = ProxioStatus(
                 at = now, fetched = tested.size, working = working,
                 error = if (working == 0) {
                     if (tested.size == 1) "The proxy didn't answer the speed test. Check the address, the login and that your plan is active."
-                    else "None of the ${tested.size} proxies answered the speed test. Check the login and that your plan is active."
+                    else "None of the ${tested.size} proxies answered the speed test. Check the login, the type (HTTP / SOCKS5) and that your plan is active."
                 } else "",
             )
-            setCustomStatus(st)
+            setStatus(st)
             return st
         }
     }
@@ -415,6 +430,61 @@ object Core {
         store.removeCustom()
         update { it.copy(custom = emptyList(), customCode = "", customStatus = ProxioStatus()) }
         if (_state.value.prefs.source == Prefs.SOURCE_CUSTOM) setSource(Prefs.SOURCE_FREE)
+    }
+
+    // =====================================================================
+    // Proxy list file (host:port:user:pass lines)
+    // =====================================================================
+
+    private fun saveList(list: List<Server>) {
+        update { it.copy(list = list) }
+        store.saveListServers(list)
+    }
+
+    private fun setListStatus(st: ProxioStatus) {
+        update { it.copy(listStatus = st) }
+        store.saveListStatus(st)
+    }
+
+    class ListImport(val status: ProxioStatus, val added: Int, val skipped: Int)
+
+    /** Replaces your proxy list with [text] (one proxy per line), tests it and switches to it if any work. */
+    fun listImport(text: String, name: String, proto: String): ListImport {
+        val parsed = ProxyList.parse(text, proto)
+        if (parsed.servers.isEmpty()) {
+            throw IOException("No proxies found. Each line should look like host:port:user:pass (or user:pass@host:port, or host:port).")
+        }
+        update { it.copy(listName = name) }
+        store.saveListName(name)
+        saveList(parsed.servers)
+        val st = testList()
+        if (st.working > 0 && _state.value.prefs.source != Prefs.SOURCE_LIST) setSource(Prefs.SOURCE_LIST)
+        else if (st.working > 0 && _state.value.on) repick()
+        return ListImport(st, parsed.servers.size, parsed.skipped)
+    }
+
+    /** Switches every proxy in the list between HTTP and SOCKS5 (the file doesn't say which) and re-tests. */
+    fun listSetProto(proto: String): ProxioStatus {
+        val list = _state.value.list
+        if (list.isEmpty() || list.all { it.proto == proto }) return _state.value.listStatus
+        saveList(list.map { s ->
+            s.copy(proto = proto, id = hashId("${ProxyList.SOURCE}:$proto://${s.username}@${s.address}:${s.port}"),
+                name = "${proto.uppercase()} ${s.hostPort}", ms = null, testedAt = 0)
+        })
+        if (_state.value.prefs.selected != "auto" && _state.value.servers.none { it.id == _state.value.prefs.selected }) {
+            savePrefs { it.copy(selected = "auto") }
+        }
+        val st = testList()
+        if (_state.value.on && _state.value.prefs.source == Prefs.SOURCE_LIST) repick()
+        return st
+    }
+
+    fun testList(): ProxioStatus = testKept({ it.list }, ::saveList, { it.listStatus }, ::setListStatus)
+
+    fun listRemove() {
+        store.removeList()
+        update { it.copy(list = emptyList(), listName = "", listStatus = ProxioStatus()) }
+        if (_state.value.prefs.source == Prefs.SOURCE_LIST) setSource(Prefs.SOURCE_FREE)
     }
 
     // =====================================================================
@@ -449,6 +519,7 @@ object Core {
             saveProxio(upd(_state.value.proxio, dropDead = true))
             saveOwn(upd(_state.value.own, dropDead = false))
             saveCustom(upd(_state.value.custom, dropDead = false))
+            saveList(upd(_state.value.list, dropDead = false))
             if (dead.isNotEmpty() && !connecting && refreshing == null) {
                 if (inUse.first().id in dead) {
                     setStatus {
@@ -486,6 +557,18 @@ object Core {
         fun best(l: List<Server>) = inCountry(l.filter { it.ms != null }).sortedBy { it.ms }.take(maxOf(2, prefs.autoPool))
 
         when (prefs.source) {
+            Prefs.SOURCE_LIST -> {
+                var list = best(_state.value.list)
+                if (list.isEmpty()) {
+                    if (_state.value.list.isEmpty()) {
+                        throw IOException("Import your proxy list (.txt) under Settings → Proxy list, or choose another server source.")
+                    }
+                    runCatching { testList() }
+                    list = best(_state.value.list)
+                }
+                if (list.isEmpty()) throw IOException(_state.value.listStatus.error.ifEmpty { "None of the proxies in your list are answering. Check the login, the type (HTTP / SOCKS5) and that your plan is active." })
+                return list
+            }
             Prefs.SOURCE_CUSTOM -> {
                 var list = best(_state.value.custom)
                 if (list.isEmpty()) {
@@ -900,6 +983,7 @@ object Core {
         val p = _state.value.prefs
         when (p.source) {
             Prefs.SOURCE_CUSTOM -> runCatching { testCustom() }
+            Prefs.SOURCE_LIST -> runCatching { testList() }
             Prefs.SOURCE_OWN -> testOwn(_state.value.own)
             Prefs.SOURCE_PROXIO -> runCatching { refreshProxio() }
             Prefs.SOURCE_BOTH -> { runCatching { refreshProxio() }; refreshFree(force = true) }

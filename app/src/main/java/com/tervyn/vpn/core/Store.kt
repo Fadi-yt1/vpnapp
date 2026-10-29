@@ -39,6 +39,14 @@ class Store(context: Context) {
     fun saveCustomStatus(s: ProxioStatus) = put("customStatus", s.toJson().toString())
     fun removeCustom() = sp.edit().remove("customServers").remove("customCode").remove("customStatus").apply()
 
+    fun listServers(): List<Server> = servers("listServers")
+    fun saveListServers(l: List<Server>) = put("listServers", JSONArray(l.map { it.toJson() }).toString())
+    fun listName(): String = sp.getString("listName", "") ?: ""
+    fun saveListName(name: String) = put("listName", name)
+    fun listStatus(): ProxioStatus = ProxioStatus.fromJson(obj("listStatus"))
+    fun saveListStatus(s: ProxioStatus) = put("listStatus", s.toJson().toString())
+    fun removeList() = sp.edit().remove("listServers").remove("listName").remove("listStatus").apply()
+
     fun freeStatus(): FreeStatus = FreeStatus.fromJson(obj("freeStatus"))
     fun saveFreeStatus(f: FreeStatus) = put("freeStatus", f.toJson().toString())
 

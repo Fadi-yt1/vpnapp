@@ -135,6 +135,7 @@ fun HomeScreen(st: AppState, onPower: () -> Unit, goTo: (Int) -> Unit) {
                             Prefs.SOURCE_BOTH -> "Proxio.io or free server"
                             Prefs.SOURCE_OWN -> "of your servers"
                             Prefs.SOURCE_CUSTOM -> "integration proxy"
+                            Prefs.SOURCE_LIST -> "proxy in your list"
                             else -> "free server"
                         } +
                             (if (prefs.country.isNotEmpty()) " in ${com.tervyn.vpn.core.countryName(prefs.country)}" else "")

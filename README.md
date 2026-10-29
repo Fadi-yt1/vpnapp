@@ -20,7 +20,11 @@ The same as the extension, for every app on your phone:
 - **Choose a country**, or keep "Fastest available".
 - **Check my IP** shows the address and country websites see.
 - **Quick Settings tile** to connect with one tap, plus support for Android's **Always-on VPN** and **Block connections without VPN**.
-- **Server source** (Settings): *Free public servers*, *Proxio.io servers (your API key)*, *Proxio.io + free servers*, *Your own servers*, or *Proxy integration*.
+- **Server source** (Settings): *Free public servers*, *Proxio.io servers (your API key)*, *Proxio.io + free servers*, *Your own servers*, *Proxy integration*, or *Proxy list (.txt file)*.
+- **Proxy list (.txt file):** in Settings, tap **Choose .txt file** and pick the list you downloaded from your provider (for example Webshare → Proxy list → Download), or paste the lines.
+  - Each line can be `host:port:user:pass`, `user:pass@host:port`, `user:pass:host:port`, `host:port`, or a full `http://` / `socks5://` address.
+  - Choose **HTTP** or **SOCKS5** for lines without a type.
+  - Tervyn tests every proxy, uses the fastest (with the rest as backups) and switches the server source to *Proxy list*.
 - **Proxy integration (curl / Python / Node.js):** paste the code example your proxy provider gives you (Webshare, Bright Data, Oxylabs, IPRoyal…), for example `curl --proxy "http://USER:PASS@1.2.3.4:6014/" https://ipv4.webshare.io/`, and tap **Save & test**. Tervyn finds the proxy address and login, tests it and uses it. It understands:
   - curl `--proxy` / `-x` / `-U` / `--socks5`
   - Python `proxies={...}`, including f-strings and variables
@@ -62,6 +66,7 @@ apps ──► Android VPN (Tervyn) ──► fastest free server (+ backups) �
 - `net/ProxyTester.kt` runs the HTTPS test on Cloudflare's trace page, 64 servers at a time.
 - `core/Core.kt` does the job of `background.js` in the extension: finding servers, choosing the fastest, health checks and failover.
 - `ui/` is the Jetpack Compose interface, in the same design as the extension popup.
+- `core/ProxyList.kt` reads proxy list files (`host:port:user:pass` and similar formats).
 - `core/ProxySnippet.kt` reads proxies out of pasted curl / Python / Node.js code.
 - `core/Proxio.kt` downloads your Proxio.io list and reads any response shape: JSON objects, JSON strings or plain `host:port:user:pass` lines.
 - `core/Links.kt` reads share links. `xray/XrayConfig.kt` turns them into an Xray config, and `xray/XrayProcess.kt` runs Xray.

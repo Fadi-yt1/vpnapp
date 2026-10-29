@@ -215,6 +215,7 @@ fun serverSub(s: Server): String {
         s.free -> "Free"
         s.isProxio -> "Proxio.io"
         s.sourceId == com.tervyn.vpn.core.ProxySnippet.SOURCE -> "Integration"
+        s.sourceId == com.tervyn.vpn.core.ProxyList.SOURCE -> "Your list"
         else -> "Yours"
     }
     val proto = if (s.isCore) {

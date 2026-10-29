@@ -39,6 +39,7 @@ val SOURCE_OPTIONS = listOf(
     Prefs.SOURCE_BOTH to "Proxio.io + free servers",
     Prefs.SOURCE_OWN to "Your own servers (VLESS, Trojan…)",
     Prefs.SOURCE_CUSTOM to "Proxy integration (curl / Python / Node.js)",
+    Prefs.SOURCE_LIST to "Proxy list (.txt file)",
 )
 
 /** Example code shown in the empty box (placeholders, not real logins). */
@@ -63,6 +64,8 @@ fun SettingsScreen(st: AppState) {
         ProxioCard(st)
         VSpace(10)
         IntegrationCard(st)
+        VSpace(10)
+        ProxyListCard(st)
 
         SectionLabel("Backup servers kept ready")
         Segmented(listOf("2", "3", "5", "8").map { it to "$it servers" }, st.prefs.autoPool.toString()) {
@@ -259,20 +262,132 @@ private fun IntegrationCard(st: AppState) {
         if (has) {
             VSpace(8)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (s in st.custom) {
-                    CardRow {
-                        FlagBadge(s.flag, 30)
-                        Column(Modifier.weight(1f)) {
-                            Text("${s.proto.uppercase()} ${s.hostPort}", color = C.text, fontSize = 13.sp, fontWeight = FontWeight.Medium,
-                                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                            Muted(listOfNotNull(
-                                s.username.takeIf { it.isNotEmpty() }?.let { "login $it" },
-                                s.country.takeIf { it != "Unknown" },
-                            ).joinToString(" · ").ifEmpty { "no login" })
-                        }
-                        PingBadge(s.ms, s.testedAt > 0)
-                    }
+                for (s in st.custom) ProxyRow(s)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProxyRow(s: com.tervyn.vpn.core.Server) {
+    CardRow {
+        FlagBadge(s.flag, 30)
+        Column(Modifier.weight(1f)) {
+            Text("${s.proto.uppercase()} ${s.hostPort}", color = C.text, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            Muted(listOfNotNull(
+                s.username.takeIf { it.isNotEmpty() }?.let { "login $it" },
+                s.country.takeIf { it != "Unknown" },
+            ).joinToString(" · ").ifEmpty { "no login" })
+        }
+        PingBadge(s.ms, s.testedAt > 0)
+    }
+}
+
+@Composable
+private fun ProxyListCard(st: AppState) {
+    val ctx = LocalContext.current
+    val ls = st.listStatus
+    val has = st.list.isNotEmpty()
+    var type by rememberSaveable(has) { mutableStateOf(st.list.firstOrNull()?.proto ?: "http") }
+    var pasteOpen by rememberSaveable { mutableStateOf(false) }
+    var paste by rememberSaveable { mutableStateOf("") }
+    var showAll by remember { mutableStateOf(false) }
+    var msg by remember { mutableStateOf("") }
+    var running by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    fun launchWork(work: () -> String) {
+        msg = ""
+        running = true
+        scope.launch {
+            msg = try { withContext(Dispatchers.IO) { work() } } catch (e: Exception) { e.message ?: e.toString() }
+            running = false
+        }
+    }
+
+    fun importList(text: String, name: String) = launchWork {
+        val r = Core.listImport(text, name, type)
+        "Imported ${r.added} proxies" + (if (r.skipped > 0) " (${r.skipped} lines skipped)" else "") + ". " +
+            if (r.status.working > 0) "${r.status.working} working. Server source is now \"Proxy list\"." else r.status.error
+    }
+
+    val picker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val name = runCatching {
+            ctx.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst()) c.getString(0) else null
+            }
+        }.getOrNull() ?: "Proxy list"
+        val text = runCatching {
+            ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().let { b -> b.copyOf(minOf(b.size, 2_000_000)) }.toString(Charsets.UTF_8) }
+        }.getOrNull()
+        if (text == null) msg = "Couldn't read that file." else importList(text, name)
+    }
+
+    Card {
+        Text("Proxy list (.txt)", color = C.text, fontWeight = FontWeight.SemiBold)
+        VSpace(2)
+        Muted("Import the proxy list file from your provider (for example Webshare → Proxy list → Download). One proxy per line, like host:port:user:pass. The list stays on this phone.")
+        VSpace(10)
+        Muted("Type of proxies in the file")
+        VSpace(6)
+        Segmented(listOf("http" to "HTTP", "socks5" to "SOCKS5"), type) { t ->
+            type = t
+            if (has && !running && !ls.busy) launchWork {
+                Core.listSetProto(t).let { r -> if (r.working > 0) "Switched to ${t.uppercase()}: ${r.working} of ${r.fetched} working." else r.error }
+            }
+        }
+        VSpace(10)
+        val busy = running || ls.busy
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PrimaryButton(if (busy) "Testing…" else if (has) "Replace with file…" else "Choose .txt file", Modifier.weight(1.4f), enabled = !busy) {
+                picker.launch(arrayOf("text/*", "application/octet-stream"))
+            }
+            GhostButton(if (pasteOpen) "Hide" else "Paste", Modifier.weight(1f)) { pasteOpen = !pasteOpen }
+        }
+        if (pasteOpen) {
+            VSpace(8)
+            Field(paste, { paste = it }, "1.2.3.4:6014:user:pass\n5.6.7.8:6015:user:pass", Modifier.fillMaxWidth(), singleLine = false, minLines = 4)
+            VSpace(8)
+            PrimaryButton("Import pasted list", Modifier.fillMaxWidth(), enabled = !busy && paste.isNotBlank()) {
+                val t = paste
+                paste = ""
+                pasteOpen = false
+                importList(t, "Pasted list")
+            }
+        }
+        if (has) {
+            VSpace(8)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GhostButton("Re-test", Modifier.weight(1f)) {
+                    if (!busy) launchWork { Core.testList().let { r -> if (r.working > 0) "${r.working} of ${r.fetched} working." else r.error } }
                 }
+                GhostButton("Remove list", Modifier.weight(1f), color = C.red) {
+                    if (!busy) { Core.listRemove(); msg = "List removed." }
+                }
+            }
+        }
+        val line = when {
+            ls.state == "testing" -> "Testing ${ls.fetched} proxies…" to C.muted
+            msg.isNotEmpty() -> msg to (if (st.list.any { it.ms != null }) C.green else C.red)
+            ls.error.isNotEmpty() && has -> ls.error to C.red
+            has && ls.at > 0 -> "${st.listName.ifEmpty { "Your list" }}: ${ls.working} of ${ls.fetched} working · tested " +
+                DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(ls.at)) to C.green
+            else -> "" to C.muted
+        }
+        if (line.first.isNotEmpty()) {
+            VSpace(10)
+            Text(line.first, color = line.second, fontSize = 12.sp)
+        }
+        if (has) {
+            VSpace(8)
+            val sorted = st.list.sortedBy { it.ms ?: if (it.testedAt == 0L) 50_000 else 100_000 }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (s in if (showAll) sorted else sorted.take(5)) ProxyRow(s)
+                if (!showAll && sorted.size > 5) GhostButton("Show all ${sorted.size} proxies", Modifier.fillMaxWidth()) { showAll = true }
             }
         }
     }

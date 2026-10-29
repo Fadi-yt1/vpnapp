@@ -27,7 +27,7 @@ object ProxyList {
         val out = LinkedHashMap<String, Server>()
         var skipped = 0
         for (raw in text.lines()) {
-            val line = raw.trim().trimStart('﻿')
+            val line = raw.trim().trimStart('\uFEFF')
             if (line.isEmpty() || line.startsWith("#") || line.startsWith("//")) continue
             val s = parseLine(line, defaultProto)
             if (s == null) skipped++ else out[s.id] = s

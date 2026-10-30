@@ -58,6 +58,9 @@ object Core {
     @Volatile private var chain: List<Server> = emptyList()
     @Volatile private var chainEndpoints: List<ProxyEndpoint> = emptyList()
 
+    /** With auto-switch off: the server to stay on (saved, so it survives list refreshes). */
+    @Volatile private var pinned: Server? = null
+
     @Volatile private var refreshing: Thread? = null
     @Volatile private var proxioRefreshing: Thread? = null
     private val proxioLock = Object()
@@ -84,6 +87,7 @@ object Core {
             list = store.listServers(), listName = store.listName(), listStatus = store.listStatus(),
             sources = store.sources(), freeStatus = store.freeStatus(),
         )
+        pinned = store.pinned()
         xrayBin = File(app.applicationInfo.nativeLibraryDir, "libxray.so").takeIf { it.exists() }
         bg {
             val bin = xrayBin ?: return@bg
@@ -523,14 +527,22 @@ object Core {
             if (dead.isNotEmpty() && !connecting && refreshing == null) {
                 if (inUse.first().id in dead) {
                     setStatus {
-                        it.copy(warning = if (_state.value.prefs.selected == "auto")
+                        it.copy(warning = if (_state.value.prefs.autoSwitch)
                             "A server stopped answering — switched to the next fastest one."
-                        else "The server you picked isn't answering. Pick another one or use Fastest.")
+                        else "The server you picked isn't answering. Pick another one, or turn on Auto-switch.")
                     }
                 }
                 repick()
             }
+            // Auto-switch: move to a clearly faster server when there is one.
             val p = _state.value.prefs
+            val cur = chain.firstOrNull()
+            val curMs = cur?.let { results[it.id]?.ms }
+            if (p.autoSwitch && p.selected == "auto" && dead.isEmpty() && cur != null && curMs != null && !connecting) {
+                val best = runCatching { pickServers(p) }.getOrNull()?.firstOrNull()
+                val bestMs = best?.ms
+                if (best != null && bestMs != null && best.id != cur.id && bestMs < curMs * 0.6 && curMs - bestMs > 300) repick()
+            }
             val since = { at: Long -> System.currentTimeMillis() - at > 5 * 60_000 }
             if (p.usesProxio && _state.value.proxio.count { it.ms != null } < 3 && since(_state.value.proxioStatus.at)) {
                 runCatching { refreshProxio() }
@@ -550,7 +562,8 @@ object Core {
     private fun pickServers(prefs: Prefs): List<Server> {
         val st = _state.value
         if (prefs.selected != "auto") {
-            st.servers.firstOrNull { it.id == prefs.selected }?.let { return listOf(it) }
+            (st.servers.firstOrNull { it.id == prefs.selected } ?: pinned?.takeIf { it.id == prefs.selected })
+                ?.let { return listOf(it) }
         }
         fun inCountry(l: List<Server>) = if (prefs.country.isEmpty()) l
             else l.filter { it.code == prefs.country }.ifEmpty { l }
@@ -672,11 +685,28 @@ object Core {
         }
     }
 
+    private fun pin(s: Server?) {
+        pinned = s
+        store.savePinned(s)
+    }
+
+    /**
+     * Auto-switch off: use only one server and stay on it. If none was chosen
+     * yet, the fastest one found now becomes the chosen server.
+     */
+    private fun applyAutoSwitch(prefs: Prefs, servers: List<Server>): List<Server> {
+        if (prefs.autoSwitch || servers.isEmpty()) return servers
+        val first = servers.first()
+        if (prefs.selected == "auto") savePrefs { it.copy(selected = first.id) }
+        pin(first)
+        return listOf(first)
+    }
+
     /** Switch servers while connected, without dropping the VPN. */
     private fun repick() {
         val prefs = _state.value.prefs
         if (!_state.value.on) return
-        val servers = runCatching { pickServers(prefs) }.getOrElse { e ->
+        val servers = runCatching { applyAutoSwitch(prefs, pickServers(prefs)) }.getOrElse { e ->
             setStatus { it.copy(warning = e.message ?: e.toString()) }
             return
         }
@@ -687,7 +717,7 @@ object Core {
             setStatus { it.copy(warning = e.message ?: e.toString()) }
             return
         }
-        setStatus { it.copy(label = label(prefs, chain), serverIds = chain.map { s -> s.id }) }
+        setStatus { it.copy(label = label(_state.value.prefs, chain), serverIds = chain.map { s -> s.id }) }
     }
 
     // =====================================================================
@@ -721,10 +751,10 @@ object Core {
             if (servers.isEmpty()) {
                 throw IOException("No free server is answering right now. Tap \"Find fastest servers\" in the Servers tab, or try again in a minute.")
             }
-            activate(servers)
+            activate(applyAutoSwitch(_state.value.prefs, servers))
             svc.startTunnel(fullMode = !prefs.targeted, router = router)
             setStatus {
-                Status(state = "on", label = label(prefs, chain), serverIds = chain.map { it.id },
+                Status(state = "on", label = label(_state.value.prefs, chain), serverIds = chain.map { it.id },
                     since = if (wasOn) it.since else System.currentTimeMillis())
             }
             update { it.copy(ipText = "") }
@@ -852,8 +882,31 @@ object Core {
         }
     }
 
+    /**
+     * Picking a server in the list. "auto" (Fastest available) turns
+     * auto-switch on; picking a specific server turns it off, so the app stays on it.
+     */
     fun select(id: String) {
-        savePrefs { it.copy(selected = id) }
+        val auto = id == "auto"
+        savePrefs { it.copy(selected = id, autoSwitch = auto) }
+        pin(if (auto) null else _state.value.servers.firstOrNull { it.id == id })
+        setStatus { it.copy(warning = "", error = "") }
+        if (_state.value.on) bg { repick() }
+    }
+
+    /**
+     * On: always use the fastest server (with backups) and switch automatically.
+     * Off: stay on the selected server (or the one in use right now).
+     */
+    fun setAutoSwitch(on: Boolean) {
+        if (on) {
+            savePrefs { it.copy(autoSwitch = true, selected = "auto") }
+            pin(null)
+        } else {
+            val current = chain.firstOrNull()?.takeIf { _state.value.on }
+            savePrefs { it.copy(autoSwitch = false, selected = current?.id ?: it.selected) }
+            if (current != null) pin(current)
+        }
         setStatus { it.copy(warning = "", error = "") }
         if (_state.value.on) bg { repick() }
     }
@@ -974,7 +1027,12 @@ object Core {
         saveOwn(own)
         update { it.copy(sources = sources) }
         store.saveSources(sources)
-        if (_state.value.prefs.selected != "auto" && _state.value.servers.none { it.id == _state.value.prefs.selected }) select("auto")
+        if (_state.value.prefs.selected != "auto" && _state.value.servers.none { it.id == _state.value.prefs.selected }) {
+            // The chosen server was in this list: fall back to the fastest (auto-switch setting unchanged).
+            savePrefs { it.copy(selected = "auto") }
+            pin(null)
+            if (_state.value.on) bg { repick() }
+        }
         if (own.isEmpty() && _state.value.prefs.source == Prefs.SOURCE_OWN) setSource(Prefs.SOURCE_FREE)
     }
 

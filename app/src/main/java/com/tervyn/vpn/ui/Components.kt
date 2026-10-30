@@ -316,3 +316,21 @@ fun VSpace(h: Int) = Spacer(Modifier.height(h.dp))
 
 @Composable
 fun HSpace(w: Int) = Spacer(Modifier.width(w.dp))
+
+/** A card with a title, an explanation and an on/off switch. */
+@Composable
+fun ToggleRow(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    CardRow(onClick = { onChange(!checked) }) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = C.text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            Text(subtitle, color = C.muted, fontSize = 11.sp)
+        }
+        androidx.compose.material3.Switch(
+            checked = checked, onCheckedChange = onChange,
+            colors = androidx.compose.material3.SwitchDefaults.colors(
+                checkedThumbColor = Color.White, checkedTrackColor = C.accent,
+                uncheckedThumbColor = C.muted, uncheckedTrackColor = Color(0x22FFFFFF), uncheckedBorderColor = C.border,
+            ),
+        )
+    }
+}

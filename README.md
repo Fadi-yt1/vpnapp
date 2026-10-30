@@ -18,6 +18,10 @@ The same as the extension, for every app on your phone:
   - **Only my sites:** only the sites you list (and their subdomains) go through the VPN, in every app and browser. Everything else stays on your normal, fast connection. It has the same one-tap presets as the extension (YouTube, Instagram, X, Discord, Telegram, ChatGPT, Claude, Netflix…).
 - **Share to add a site:** in any browser or app, tap **Share → Tervyn VPN** to add that site to your list.
 - **Choose a country**, or keep "Fastest available".
+- **Auto-switch to fastest server** (toggle on Home and in Settings):
+  - **On:** Tervyn always uses the fastest server with backups ready. It switches when one stops working, and it also moves to a clearly faster server (at least 40% faster) when one shows up.
+  - **Off:** it stays on the selected server and never switches. If you haven't picked one, it stays on the fastest server found when you connect.
+  - Picking a server in the Servers list turns auto-switch off; picking "Fastest available" turns it back on.
 - **Check my IP** shows the address and country websites see.
 - **Quick Settings tile** to connect with one tap, plus support for Android's **Always-on VPN** and **Block connections without VPN**.
 - **Server source** (Settings): *Free public servers*, *Proxio.io servers (your API key)*, *Proxio.io + free servers*, *Your own servers*, *Proxy integration*, or *Proxy list (.txt file)*.

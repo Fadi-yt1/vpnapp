@@ -67,6 +67,14 @@ fun SettingsScreen(st: AppState) {
         VSpace(10)
         ProxyListCard(st)
 
+        SectionLabel("Server switching")
+        ToggleRow(
+            "Auto-switch to fastest server",
+            if (st.prefs.autoSwitch) "On: always uses the fastest server, keeps backups ready and switches automatically."
+            else "Off: stays on the selected server and never switches (no backups).",
+            st.prefs.autoSwitch, Core::setAutoSwitch,
+        )
+
         SectionLabel("Backup servers kept ready")
         Segmented(listOf("2", "3", "5", "8").map { it to "$it servers" }, st.prefs.autoPool.toString()) {
             Core.setAutoPool(it.toInt())

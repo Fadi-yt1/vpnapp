@@ -47,6 +47,10 @@ class Store(context: Context) {
     fun saveListStatus(s: ProxioStatus) = put("listStatus", s.toJson().toString())
     fun removeList() = sp.edit().remove("listServers").remove("listName").remove("listStatus").apply()
 
+    /** The server you chose to stay on (kept even if it drops out of a server list). */
+    fun pinned(): Server? = obj("pinned")?.let { runCatching { Server.fromJson(it) }.getOrNull() }
+    fun savePinned(s: Server?) = if (s == null) sp.edit().remove("pinned").apply() else put("pinned", s.toJson().toString())
+
     fun freeStatus(): FreeStatus = FreeStatus.fromJson(obj("freeStatus"))
     fun saveFreeStatus(f: FreeStatus) = put("freeStatus", f.toJson().toString())
 

@@ -130,6 +130,7 @@ fun HomeScreen(st: AppState, onPower: () -> Unit, goTo: (Int) -> Unit) {
                 )
                 Text(
                     when {
+                        active == null && !prefs.autoSwitch -> "Auto-switch off · stays on the fastest server found when you connect"
                         active == null -> "Auto · picks the fastest " + when (prefs.source) {
                             Prefs.SOURCE_PROXIO -> "Proxio.io server"
                             Prefs.SOURCE_BOTH -> "Proxio.io or free server"
@@ -148,6 +149,14 @@ fun HomeScreen(st: AppState, onPower: () -> Unit, goTo: (Int) -> Unit) {
             if (active?.ms != null) PingBadge(active.ms, true)
             Icon(TIcons.chevron, null, tint = C.muted, modifier = Modifier.size(16.dp))
         }
+
+        VSpace(8)
+        ToggleRow(
+            "Auto-switch to fastest server",
+            if (prefs.autoSwitch) "On: uses the fastest server and switches automatically if it slows down or stops working."
+            else "Off: stays on the selected server and never switches.",
+            prefs.autoSwitch, Core::setAutoSwitch,
+        )
 
         VSpace(14)
         CardRow(onClick = Core::checkIp) {

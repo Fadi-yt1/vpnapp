@@ -74,6 +74,7 @@ data class Prefs(
     val autoPool: Int = 5,              // servers kept ready (first one + backups)
     val country: String = "",           // limit auto mode to one country code ("" = any)
     val source: String = SOURCE_FREE,   // where auto mode gets servers from
+    val autoSwitch: Boolean = true,     // true: always use the fastest server and switch automatically
 ) {
     val targeted get() = mode == MODE_TARGETED
     val usesFree get() = source == SOURCE_FREE || source == SOURCE_BOTH
@@ -83,6 +84,7 @@ data class Prefs(
         put("enabled", enabled); put("mode", mode); put("selected", selected)
         put("sites", JSONArray(sites)); put("autoPool", autoPool); put("country", country)
         put("source", source)
+        put("autoSwitch", autoSwitch)
     }
 
     companion object {
@@ -102,6 +104,7 @@ data class Prefs(
                 selected = o.optString("selected", "auto"), sites = sites,
                 autoPool = o.optInt("autoPool", 5), country = o.optString("country"),
                 source = o.optString("source", SOURCE_FREE),
+                autoSwitch = o.optBoolean("autoSwitch", true),
             )
         }
     }

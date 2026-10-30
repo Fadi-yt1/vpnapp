@@ -65,6 +65,7 @@ object Core {
     @Volatile private var proxioRefreshing: Thread? = null
     private val proxioLock = Object()
     @Volatile private var connecting = false
+    @Volatile private var connectAgain = false
     @Volatile private var checkingHealth = false
     @Volatile private var service: TervynVpnService? = null
     private val failTimes = ArrayDeque<Long>()
@@ -727,13 +728,26 @@ object Core {
     /** The service is running and wants to connect (from the app, the tile or always-on VPN). */
     fun connect(svc: TervynVpnService) {
         service = svc
-        if (connecting) return
-        connecting = true
+        synchronized(this) {
+            if (connecting) {
+                // A connect is still running (e.g. waiting for servers after the user pressed stop):
+                // run again when it finishes instead of dropping this request.
+                connectAgain = true
+                return
+            }
+            connecting = true
+        }
         bg {
+            var done = false
             try {
-                doConnect(svc)
+                while (!done) {
+                    doConnect(service ?: svc)
+                    synchronized(this) {
+                        if (connectAgain) connectAgain = false else { connecting = false; done = true }
+                    }
+                }
             } finally {
-                connecting = false
+                if (!done) synchronized(this) { connecting = false; connectAgain = false }
             }
         }
     }

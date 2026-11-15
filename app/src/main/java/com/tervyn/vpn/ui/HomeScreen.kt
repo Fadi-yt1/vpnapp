@@ -150,7 +150,8 @@ fun HomeScreen(st: AppState, nav: Nav, onPower: () -> Unit) {
                 )
                 Text(
                     when {
-                        on && st.status.hops.isNotEmpty() -> "Multi-hop ${st.status.hops} · ${st.status.label}"
+                        on && st.status.hops.isNotEmpty() -> "Multi-hop ${st.status.hops}" + (active?.let { " · " + serverSub(it) } ?: "")
+                        on && active != null -> serverSub(active)
                         on -> st.status.label
                         active == null -> "Smart Connect · " + sourceName(prefs.source) +
                             (if (prefs.country.isNotEmpty()) " in ${countryName(prefs.country)}" else "")

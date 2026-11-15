@@ -164,7 +164,7 @@ fun Modifier.glass(shape: Shape = ShapeCard, selected: Boolean = false, strong: 
                 ),
             ) else Modifier,
         )
-        .then(if (strong && !blur) Modifier.background(p.bg1.copy(alpha = if (p.isDark) 0.88f else 0.82f)) else Modifier)
+        .then(if (strong && !blur) Modifier.background(p.bg1.copy(alpha = if (p.isDark) 0.95f else 0.92f)) else Modifier)
         .background(fill)
         .drawBehind {
             // Specular highlight along the top edge.

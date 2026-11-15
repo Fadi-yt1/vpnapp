@@ -66,9 +66,10 @@ fun DnsScreen(st: AppState, nav: Nav) {
                         },
                     )
                 }
-                p.dnsProfiles.firstOrNull { it.id == p.dnsProfile }?.let { prof ->
-                    GlassStatusBadge(prof.name.uppercase(), C.accentLight)
-                }
+            }
+            p.dnsProfiles.firstOrNull { it.id == p.dnsProfile }?.let { prof ->
+                VSpace(10)
+                GlassStatusBadge("PROFILE · ${prof.name.uppercase()}", C.accentLight)
             }
             if (dns.addresses.isNotEmpty() && dns.mode != DnsConfig.AUTO) {
                 VSpace(8)

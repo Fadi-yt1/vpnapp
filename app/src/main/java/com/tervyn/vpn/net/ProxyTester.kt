@@ -16,7 +16,7 @@ import javax.net.ssl.SSLSocketFactory
  * sites, doesn't tamper with traffic, and tells us the server's real country.
  */
 object ProxyTester {
-    class Result(val ms: Int, val code: String, val ip: String)
+    class Result(val ms: Int, val code: String, val ip: String, val mbps: Double? = null)
 
     /** Cloudflare sites that answer /cdn-cgi/trace with the visitor's IP and country. */
     private val TRACE_HOSTS = listOf(
@@ -49,6 +49,7 @@ object ProxyTester {
         threads: Int = 64,
         stopAfter: Int = Int.MAX_VALUE,
         maxTimeMs: Long = Long.MAX_VALUE,
+        probe: (ProxyEndpoint) -> Result? = { test(it) },
         onResult: (T, Result?) -> Unit,
     ) {
         if (servers.isEmpty()) return
@@ -59,7 +60,7 @@ object ProxyTester {
             for (s in servers) {
                 pool.execute {
                     if (stop.get()) return@execute
-                    val r = test(s)
+                    val r = probe(s)
                     if (stop.get() && r == null) return@execute
                     if (r != null && working.incrementAndGet() >= stopAfter) stop.set(true)
                     synchronized(this) { onResult(s, r) }
@@ -70,6 +71,57 @@ object ProxyTester {
         } finally {
             stop.set(true)
             pool.shutdownNow()
+        }
+    }
+
+    private const val SPEED_HOST = "speed.cloudflare.com"
+
+    /**
+     * Download speed test through a server: fetches [bytes] from Cloudflare's
+     * speed test over HTTPS and measures the transfer. ms = time to first byte.
+     */
+    fun speedTest(p: ProxyEndpoint, bytes: Int = 1_000_000, timeoutMs: Int = 15_000): Result? {
+        val t0 = System.nanoTime()
+        return try {
+            ProxyDialer.open(p, SPEED_HOST, 443, 6000).use { raw ->
+                raw.soTimeout = 8000
+                val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                (factory.createSocket(raw, SPEED_HOST, 443, true) as SSLSocket).use { ssl ->
+                    ssl.soTimeout = 8000
+                    ssl.startHandshake()
+                    if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(SPEED_HOST, ssl.session)) return null
+                    val req = "GET /__down?bytes=$bytes HTTP/1.0\r\nHost: $SPEED_HOST\r\nUser-Agent: TervynVPN/1.0\r\nConnection: close\r\n\r\n"
+                    ssl.outputStream.apply { write(req.toByteArray()); flush() }
+                    val inp = ssl.inputStream
+                    val buf = ByteArray(32 * 1024)
+                    val head = StringBuilder()
+                    var body = 0L
+                    var tFirst = 0L
+                    val deadline = t0 + timeoutMs * 1_000_000L
+                    while (System.nanoTime() < deadline) {
+                        val n = inp.read(buf)
+                        if (n < 0) break
+                        if (tFirst == 0L) {
+                            // Still in the headers: find where the body starts.
+                            head.append(String(buf, 0, n, Charsets.ISO_8859_1))
+                            val end = head.indexOf("\r\n\r\n")
+                            if (end < 0) continue
+                            val status = head.substring(0, head.indexOf("\r\n")).split(' ').getOrNull(1)?.toIntOrNull()
+                            if (status != 200) return null
+                            tFirst = System.nanoTime()
+                            body = (head.length - end - 4).toLong()
+                        } else {
+                            body += n
+                        }
+                        if (body >= bytes) break
+                    }
+                    val secs = (System.nanoTime() - tFirst) / 1e9
+                    if (tFirst == 0L || body < 100_000 || secs <= 0) return null
+                    Result(((tFirst - t0) / 1_000_000).toInt(), "", "", mbps = body * 8 / secs / 1e6)
+                }
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 

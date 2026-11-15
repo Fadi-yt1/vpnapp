@@ -25,11 +25,13 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.ui.res.painterResource
+import com.tervyn.vpn.R
 import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -128,32 +130,19 @@ private val TABS = listOf(Tab("Home", TIcons.home), Tab("Servers", TIcons.server
 fun App(onPower: () -> Unit) {
     val st by Core.state.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableIntStateOf(0) }
-    Scaffold(
-        containerColor = C.bg2,
-        topBar = { Header(st) },
-        bottomBar = {
-            NavigationBar(containerColor = C.bg2, tonalElevation = 0.dp) {
-                TABS.forEachIndexed { i, t ->
-                    NavigationBarItem(
-                        selected = tab == i, onClick = { tab = i },
-                        icon = { Icon(t.icon, null, modifier = Modifier.size(22.dp)) },
-                        label = { Text(t.label, fontSize = 12.sp) },
-                        colors = NavigationBarItemDefaults.colors(
-                            selectedIconColor = Color.White, selectedTextColor = C.text,
-                            indicatorColor = C.accentSoft, unselectedIconColor = C.muted, unselectedTextColor = C.muted,
-                        ),
-                    )
+    Box(Modifier.fillMaxSize()) {
+        GlassBackground(on = st.on)
+        Column(Modifier.fillMaxSize()) {
+            Header(st)
+            Box(Modifier.weight(1f).fillMaxWidth().imePadding()) {
+                when (tab) {
+                    0 -> HomeScreen(st, onPower) { tab = it }
+                    1 -> ServersScreen(st) { tab = 0 }
+                    2 -> SitesScreen(st)
+                    else -> SettingsScreen(st)
                 }
             }
-        },
-    ) { pad ->
-        Box(Modifier.fillMaxSize().background(C.background).padding(pad)) {
-            when (tab) {
-                0 -> HomeScreen(st, onPower) { tab = it }
-                1 -> ServersScreen(st) { tab = 0 }
-                2 -> SitesScreen(st)
-                else -> SettingsScreen(st)
-            }
+            GlassNavBar(tab) { tab = it }
         }
     }
 }
@@ -161,16 +150,19 @@ fun App(onPower: () -> Unit) {
 @Composable
 private fun Header(st: AppState) {
     Row(
-        Modifier.fillMaxWidth().background(C.bg1).statusBarsPadding().padding(horizontal = 18.dp, vertical = 12.dp),
+        Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 18.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Image(TIcons.logo, null, modifier = Modifier.size(30.dp))
-            HSpace(9)
+            Image(
+                painterResource(R.drawable.logo_full), "Tervyn",
+                modifier = Modifier.size(38.dp).clip(RoundedCornerShape(11.dp)).border(1.dp, C.glassBorder, RoundedCornerShape(11.dp)),
+            )
+            HSpace(10)
             Text("Tervyn", color = C.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            HSpace(3)
-            Text("VPN", color = C.accent, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp,
+            HSpace(4)
+            Text("VPN", color = C.cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
                 modifier = Modifier.padding(top = 5.dp))
         }
         val (label, color) = when {
@@ -178,15 +170,39 @@ private fun Header(st: AppState) {
             st.on -> "PROTECTED" to C.green
             else -> "OFF" to C.muted
         }
-        val shape = RoundedCornerShape(99.dp)
         Row(
-            Modifier.clip(shape).background(color.copy(alpha = 0.08f)).border(1.dp, color.copy(alpha = 0.35f), shape)
-                .padding(horizontal = 11.dp, vertical = 5.dp),
+            Modifier.glass(RoundedCornerShape(99.dp)).padding(horizontal = 12.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.size(7.dp).clip(CircleShape).background(color))
+            Box(Modifier.size(8.dp).clip(CircleShape).background(color))
             HSpace(7)
             Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+        }
+    }
+}
+
+/** Floating frosted tab bar. */
+@Composable
+private fun GlassNavBar(tab: Int, onSelect: (Int) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp)
+            .glass(RoundedCornerShape(28.dp)).padding(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        TABS.forEachIndexed { i, t ->
+            val active = tab == i
+            Column(
+                Modifier.weight(1f).clip(RoundedCornerShape(22.dp))
+                    .then(if (active) Modifier.background(C.glassFillSelected).border(1.dp, C.glassBorderSelected, RoundedCornerShape(22.dp)) else Modifier)
+                    .clickable { onSelect(i) }
+                    .padding(vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Icon(t.icon, t.label, tint = if (active) Color.White else C.muted, modifier = Modifier.size(22.dp))
+                VSpace(3)
+                Text(t.label, color = if (active) Color.White else C.muted, fontSize = 11.sp,
+                    fontWeight = if (active) FontWeight.Bold else FontWeight.Medium)
+            }
         }
     }
 }

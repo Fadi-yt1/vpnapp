@@ -1,5 +1,6 @@
 import java.net.URI
 import java.security.MessageDigest
+import java.util.Properties
 import java.util.zip.ZipInputStream
 
 plugins {
@@ -16,8 +17,8 @@ android {
         applicationId = "com.tervyn.vpn"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "2.0.0"
     }
 
     // Xray-core is bundled as libxray.so: Android only lets apps run programs from their native-library folder.
@@ -38,14 +39,31 @@ android {
         }
     }
 
+    // Release signing key: from keystore.properties (local builds, never committed) or from the
+    // TERVYN_KEYSTORE* environment variables (GitHub Actions secrets). Without one, the debug key is used.
+    val keyProps = Properties().apply {
+        val f = rootProject.file("keystore.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+    fun keyValue(prop: String, env: String): String? = keyProps.getProperty(prop) ?: System.getenv(env)?.takeIf { it.isNotBlank() }
+    val releaseStore = keyValue("storeFile", "TERVYN_KEYSTORE")?.let { rootProject.file(it) }?.takeIf { it.exists() }
+    signingConfigs {
+        if (releaseStore != null) {
+            create("release") {
+                storeFile = releaseStore
+                storePassword = keyValue("storePassword", "TERVYN_KEYSTORE_PASSWORD")
+                keyAlias = keyValue("keyAlias", "TERVYN_KEY_ALIAS") ?: "tervyn"
+                keyPassword = keyValue("keyPassword", "TERVYN_KEY_PASSWORD") ?: storePassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Signed with the debug key so the APK installs right away.
-            // Use your own key before publishing on Google Play.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (releaseStore != null) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
         }
     }
 

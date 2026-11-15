@@ -121,6 +121,35 @@ object Dns {
         return Question(sb.toString().lowercase(), Ip.u16(m, i), i + 4)
     }
 
+    /** IPv4 addresses in the answer section of a reply. */
+    fun answerIps(m: ByteArray): List<Int> {
+        val out = ArrayList<Int>()
+        try {
+            val qd = Ip.u16(m, 4)
+            val an = Ip.u16(m, 6)
+            var i = 12
+            fun skipName() {
+                while (true) {
+                    val l = m[i].toInt() and 0xff
+                    if (l == 0) { i += 1; return }
+                    if (l and 0xC0 == 0xC0) { i += 2; return }
+                    i += 1 + l
+                }
+            }
+            repeat(qd) { skipName(); i += 4 }
+            repeat(an) {
+                skipName()
+                val type = Ip.u16(m, i)
+                val len = Ip.u16(m, i + 8)
+                i += 10
+                if (type == A && len == 4) out += Ip.i32(m, i)
+                i += len
+            }
+        } catch (_: IndexOutOfBoundsException) {
+        }
+        return out
+    }
+
     /** Answer with one A record ([ip]) or with no records at all (ip = null). */
     fun reply(query: ByteArray, q: Question, ip: Int?, ttl: Int = 60): ByteArray {
         val out = ByteArray(q.end + if (ip != null) 16 else 0)

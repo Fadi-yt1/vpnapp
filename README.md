@@ -17,6 +17,22 @@ The same as the extension, for every app on your phone:
   - **All apps:** all traffic goes through the VPN.
   - **Only my sites:** only the sites you list (and their subdomains) go through the VPN, in every app and browser. Everything else stays on your normal, fast connection. It has the same one-tap presets as the extension (YouTube, Instagram, X, Discord, Telegram, ChatGPT, Claude, Netflix…).
 - **Share to add a site:** in any browser or app, tap **Share → Tervyn VPN** to add that site to your list.
+- **Glass design:** frosted panels over softly moving cyan, blue and violet glows, with a big glass connect orb and the Tervyn logo as the app icon.
+- **Top 20 servers:** the Servers tab ranks working servers by ping *and* measured download speed (Mbps), with country flag, name, signal bars and speed.
+- **Connection speed** (Settings):
+  - live download / upload speed on Home and in the VPN notification, updated every second
+  - data used this session
+  - a speed test for the server in use
+- **Separate DNS** (Settings): choose one of these, with lookups sent encrypted (DNS over HTTPS):
+  - *Automatic*
+  - *Cloudflare*
+  - *Google*
+  - *Quad9* (blocks malware)
+  - *AdGuard* (blocks ads and trackers)
+  - *Cloudflare Family*
+  - *Custom* (IP addresses or a `https://…/dns-query` address)
+
+  Filtering providers block what they filter, even for apps going through the VPN.
 - **Choose a country**, or keep "Fastest available".
 - **Auto-switch to fastest server** (toggle on Home and in Settings):
   - **On:** Tervyn always uses the fastest server with backups ready. It switches when one stops working, and it also moves to a clearly faster server (at least 40% faster) when one shows up.
@@ -45,7 +61,18 @@ Every push builds the app on GitHub:
 2. Download the **tervyn-vpn-apk** artifact and unzip it.
 3. Copy **`app-arm64-v8a-release.apk`** to your phone and open it (almost all phones from the last few years). If it says the app isn't compatible, use `app-universal-release.apk`. Allow "install unknown apps" if Android asks.
 
-The release APK is signed with a debug key so it installs right away. Before publishing on Google Play, create your own signing key and set it in `app/build.gradle.kts`.
+### Release signing
+
+The release APK is signed with your own key when you add these four repository secrets (GitHub → Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `KEYSTORE_BASE64` | the keystore file, base64-encoded (`base64 -w0 tervyn-release.jks`) |
+| `KEYSTORE_PASSWORD` | the keystore password |
+| `KEY_ALIAS` | `tervyn` |
+| `KEY_PASSWORD` | the key password |
+
+Without them, the release APK is signed with a debug key. For local builds, put the same values in a `keystore.properties` file at the project root (`storeFile=…`, `storePassword=…`, `keyAlias=…`, `keyPassword=…`); git ignores it. Never commit the keystore. Keep a backup: app updates must be signed with the same key.
 
 ## Build it yourself
 

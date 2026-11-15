@@ -21,7 +21,18 @@ data class Server(
     val ms: Int? = null,        // last measured delay, null = not working / untested
     val testedAt: Long = 0,
     val link: String = "",      // share link, for VLESS / VMess / Trojan / Shadowsocks servers
+    val mbps: Double? = null,   // measured download speed, null = not measured
 ) : ProxyEndpoint {
+    /**
+     * Lower is better: delay plus a penalty that shrinks with download speed,
+     * so a server with low ping AND high speed comes first.
+     */
+    val rank: Int get() = when {
+        ms == null -> Int.MAX_VALUE
+        mbps == null -> ms + 1500
+        else -> ms + (3000 / (1.0 + mbps)).toInt()
+    }
+
     /** Needs Xray (VLESS, VMess, Trojan, Shadowsocks). Plain SOCKS5 / HTTP servers don't. */
     val isCore: Boolean get() = proto in CORE_PROTOS
     val isProxio: Boolean get() = sourceId == PROXIO_SOURCE
@@ -36,6 +47,7 @@ data class Server(
         if (ms != null) put("ms", ms)
         put("testedAt", testedAt)
         if (link.isNotEmpty()) put("link", link)
+        if (mbps != null) put("mbps", mbps)
     }
 
     companion object {
@@ -46,6 +58,7 @@ data class Server(
             sourceId = o.optString("sourceId", "free"), score = o.optInt("score"),
             ms = if (o.has("ms")) o.getInt("ms") else null, testedAt = o.optLong("testedAt"),
             link = o.optString("link"),
+            mbps = if (o.has("mbps")) o.getDouble("mbps") else null,
         )
 
         val CORE_PROTOS = setOf("vless", "vmess", "trojan", "shadowsocks")
@@ -75,6 +88,10 @@ data class Prefs(
     val country: String = "",           // limit auto mode to one country code ("" = any)
     val source: String = SOURCE_FREE,   // where auto mode gets servers from
     val autoSwitch: Boolean = true,     // true: always use the fastest server and switch automatically
+    val showSpeed: Boolean = true,      // live download / upload speed on the Home screen
+    val speedInNotification: Boolean = true,
+    val dns: String = DnsChoice.AUTO,   // DNS provider id (see DnsChoice)
+    val customDns: String = "",         // IP address(es) or https:// DoH address, for dns = "custom"
 ) {
     val targeted get() = mode == MODE_TARGETED
     val usesFree get() = source == SOURCE_FREE || source == SOURCE_BOTH
@@ -85,6 +102,8 @@ data class Prefs(
         put("sites", JSONArray(sites)); put("autoPool", autoPool); put("country", country)
         put("source", source)
         put("autoSwitch", autoSwitch)
+        put("showSpeed", showSpeed); put("speedInNotification", speedInNotification)
+        put("dns", dns); put("customDns", customDns)
     }
 
     companion object {
@@ -105,6 +124,9 @@ data class Prefs(
                 autoPool = o.optInt("autoPool", 5), country = o.optString("country"),
                 source = o.optString("source", SOURCE_FREE),
                 autoSwitch = o.optBoolean("autoSwitch", true),
+                showSpeed = o.optBoolean("showSpeed", true),
+                speedInNotification = o.optBoolean("speedInNotification", true),
+                dns = o.optString("dns", DnsChoice.AUTO), customDns = o.optString("customDns"),
             )
         }
     }
@@ -146,7 +168,7 @@ data class FreeStatus(
     val error: String = "",
     val sources: Int = 0,
 ) {
-    val busy get() = state == "loading" || state == "testing"
+    val busy get() = state == "loading" || state == "testing" || state == "speed"
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("at", at); put("found", found); put("working", working); put("sources", sources); put("error", error)
@@ -200,13 +222,42 @@ data class AppState(
     val ipText: String = "",
     val xrayVersion: String = "",       // "" = Xray isn't included in this build
     val ownTesting: Boolean = false,    // your own servers are being tested
+    val traffic: Traffic = Traffic(),
+    val speedTest: SpeedTest = SpeedTest(),
 ) {
     val servers: List<Server> get() = (list + custom + proxio + free + own).distinctBy { it.id }
     val on: Boolean get() = prefs.enabled && status.state == "on"
     val connecting: Boolean get() = status.state == "connecting"
 }
 
+/** Live VPN traffic: bytes per second and totals since connecting. */
+data class Traffic(val down: Long = 0, val up: Long = 0, val totalDown: Long = 0, val totalUp: Long = 0)
+
+/** Result of the speed test in Settings. */
+data class SpeedTest(
+    val running: Boolean = false,
+    val mbps: Double? = null,
+    val ms: Int? = null,
+    val server: String = "",
+    val at: Long = 0,
+    val error: String = "",
+)
+
 // ---------- helpers ----------
+
+/** 1536 -> "1.5 KB/s". */
+fun formatRate(bytesPerSec: Long): String = formatBytes(bytesPerSec) + "/s"
+
+fun formatBytes(b: Long): String = when {
+    b < 1024 -> "$b B"
+    b < 1024 * 1024 -> String.format(Locale.US, "%.1f KB", b / 1024.0)
+    b < 1024L * 1024 * 1024 -> String.format(Locale.US, "%.1f MB", b / (1024.0 * 1024))
+    else -> String.format(Locale.US, "%.2f GB", b / (1024.0 * 1024 * 1024))
+}
+
+fun formatMbps(mbps: Double): String =
+    if (mbps >= 10) String.format(Locale.US, "%.0f Mbps", mbps) else String.format(Locale.US, "%.1f Mbps", mbps)
+
 
 /** FNV-1a 32-bit, same as the extension, so ids match. */
 fun hashId(str: String): String {

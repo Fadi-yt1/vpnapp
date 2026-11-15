@@ -3,9 +3,6 @@ package com.tervyn.vpn.vpn
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -21,8 +18,12 @@ interface Router {
     fun connectProxied(host: String, port: Int): Socket
     /** Normal connection (not through the VPN). */
     fun connectDirect(host: String, port: Int): Socket
-    /** Your normal DNS servers, used for sites that don't go through the VPN. */
-    fun upstreamDns(): List<InetAddress>
+    /** Looks up a raw DNS query the engine doesn't answer itself (other sites, other record types). */
+    fun forwardDns(query: ByteArray): ByteArray?
+    /** True when a DNS provider was chosen, so names are checked with it before going through the VPN. */
+    val checksNames: Boolean
+    /** The provider's reply if it blocks this name (ad / malware filter), else null. */
+    fun blockedReply(query: ByteArray, name: String): ByteArray?
 }
 
 /**
@@ -51,6 +52,10 @@ class TunEngine(
 
     val connectionCount get() = conns.size
 
+    /** Bytes sent to apps (download) and received from apps (upload), for the live speed display. */
+    val bytesDown = java.util.concurrent.atomic.AtomicLong()
+    val bytesUp = java.util.concurrent.atomic.AtomicLong()
+
     fun start() {
         running = true
         Thread({ loop() }, "tervyn-tun").apply { isDaemon = true }.start()
@@ -69,6 +74,7 @@ class TunEngine(
         if (!running) return
         try {
             synchronized(output) { output.write(packet) }
+            bytesDown.addAndGet(packet.size.toLong())
         } catch (_: IOException) {
         }
     }
@@ -84,6 +90,7 @@ class TunEngine(
                 val n = input.read(buf)
                 if (n < 0) break
                 if (n == 0) continue
+                bytesUp.addAndGet(n.toLong())
                 try {
                     handle(buf, n)
                 } catch (e: Exception) {
@@ -130,27 +137,14 @@ class TunEngine(
         val reply = { data: ByteArray -> write(Ip.udp(dst, src, dport, sport, data)) }
         val proxied = q.name.isNotEmpty() && router.shouldProxy(q.name)
         when {
-            proxied && q.type == Dns.A -> reply(Dns.reply(payload, q, fakeDns.ipFor(q.name)))
+            proxied && q.type == Dns.A -> {
+                if (!router.checksNames) reply(Dns.reply(payload, q, fakeDns.ipFor(q.name)))
+                // A DNS provider was chosen: let it block ads / malware first.
+                else pool.execute { reply(router.blockedReply(payload, q.name) ?: Dns.reply(payload, q, fakeDns.ipFor(q.name))) }
+            }
             // No IPv6 / HTTPS records for VPN sites, so apps use the stand-in IPv4 address.
             proxied && (q.type == Dns.AAAA || q.type == Dns.HTTPS) -> reply(Dns.reply(payload, q, null))
-            else -> pool.execute { forwardDns(payload, reply) }
-        }
-    }
-
-    private fun forwardDns(payload: ByteArray, reply: (ByteArray) -> Unit) {
-        for (server in router.upstreamDns()) {
-            try {
-                DatagramSocket().use { s ->
-                    s.soTimeout = 3000
-                    s.send(DatagramPacket(payload, payload.size, server, 53))
-                    val buf = ByteArray(4096)
-                    val p = DatagramPacket(buf, buf.size)
-                    s.receive(p)
-                    reply(buf.copyOf(p.length))
-                    return
-                }
-            } catch (_: Exception) {
-            }
+            else -> pool.execute { router.forwardDns(payload)?.let(reply) }
         }
     }
 

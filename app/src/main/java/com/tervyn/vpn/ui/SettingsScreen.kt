@@ -27,6 +27,14 @@ import com.tervyn.vpn.BuildConfig
 import com.tervyn.vpn.core.AppState
 import com.tervyn.vpn.core.Core
 import com.tervyn.vpn.core.Prefs
+import com.tervyn.vpn.core.DnsChoice
+import com.tervyn.vpn.core.formatMbps
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.height
+import androidx.compose.ui.Alignment
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -66,6 +74,12 @@ fun SettingsScreen(st: AppState) {
         IntegrationCard(st)
         VSpace(10)
         ProxyListCard(st)
+
+        SectionLabel("Connection speed")
+        SpeedSection(st)
+
+        SectionLabel("DNS")
+        DnsSection(st)
 
         SectionLabel("Server switching")
         ToggleRow(
@@ -399,4 +413,69 @@ private fun ProxyListCard(st: AppState) {
             }
         }
     }
+}
+
+@Composable
+private fun SpeedSection(st: AppState) {
+    val p = st.prefs
+    val t = st.speedTest
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        ToggleRow(
+            "Live speed on Home", "Download and upload speed while connected, updated every second.",
+            p.showSpeed, Core::setShowSpeed,
+        )
+        ToggleRow(
+            "Live speed in notification", "Shows ↓ download and ↑ upload in the VPN notification, updated every second.",
+            p.speedInNotification, Core::setSpeedInNotification,
+        )
+        Card {
+            Text("Speed test", color = C.text, fontWeight = FontWeight.SemiBold)
+            VSpace(2)
+            Muted(if (st.on) "Measures download speed through the server you're connected to." else "Measures download speed of the best server for your source.")
+            VSpace(12)
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(t.mbps?.let { formatMbps(it) } ?: "—", color = C.text, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                HSpace(10)
+                if (t.ms != null) Muted("${t.ms} ms to first byte", Modifier.padding(bottom = 6.dp))
+            }
+            if (t.server.isNotEmpty()) Muted("${t.server} · " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(t.at)))
+            if (t.error.isNotEmpty()) { VSpace(6); Text(t.error, color = C.red, fontSize = 12.sp) }
+            VSpace(12)
+            PrimaryButton(if (t.running) "Testing…" else "Run speed test", Modifier.fillMaxWidth(), enabled = !t.running) { Core.runSpeedTest() }
+        }
+    }
+}
+
+@Composable
+private fun DnsSection(st: AppState) {
+    val p = st.prefs
+    var custom by rememberSaveable(p.customDns) { mutableStateOf(p.customDns) }
+    val options = listOf(Triple(DnsChoice.AUTO, "Automatic", "VPN sites are looked up by the VPN server; others by your network")) +
+        DnsChoice.PROVIDERS.map { Triple(it.id, it.name, it.about) } +
+        Triple(DnsChoice.CUSTOM, "Custom", "Your own DNS server")
+    Card(padding = PaddingValues(vertical = 6.dp)) {
+        options.forEachIndexed { i, (id, name, about) ->
+            Row(
+                Modifier.fillMaxWidth().clickable { Core.setDns(id, custom) }.padding(horizontal = 16.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioDot(p.dns == id)
+                HSpace(12)
+                Column(Modifier.weight(1f)) {
+                    Text(name, color = C.text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Text(about, color = C.muted, fontSize = 11.sp)
+                }
+            }
+            if (i < options.size - 1) Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp).height(1.dp).background(C.border))
+        }
+    }
+    if (p.dns == DnsChoice.CUSTOM) {
+        VSpace(10)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Field(custom, { custom = it }, "1.1.1.1, 8.8.8.8 or https://…/dns-query", Modifier.weight(1f))
+            PrimaryButton("Save", enabled = custom.isNotBlank() && custom.trim() != p.customDns) { Core.setDns(DnsChoice.CUSTOM, custom) }
+        }
+    }
+    VSpace(8)
+    Muted("Chosen providers are used over encrypted DNS (DNS over HTTPS). AdGuard, Quad9 and Cloudflare Family also block what they filter, in every app that goes through the VPN.")
 }

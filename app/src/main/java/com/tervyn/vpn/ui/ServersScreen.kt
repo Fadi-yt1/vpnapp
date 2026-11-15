@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -39,6 +40,7 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
     var country by rememberSaveable { mutableStateOf("") }
     var showAll by remember { mutableStateOf(false) }
+    var view by rememberSaveable { mutableStateOf("top") }
     val fs = st.freeStatus
     val ps = st.proxioStatus
     val src = st.prefs.source
@@ -54,19 +56,26 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
     val list = st.servers.distinctBy { it.id }
         .filter { country.isEmpty() || it.code == country }
         .filter { s -> query.isBlank() || "${s.name} ${s.address} ${s.country} ${s.proto}".lowercase().contains(query.trim().lowercase()) }
-        .sortedBy { it.ms ?: if (it.testedAt == 0L) 50_000 else 100_000 }
+        .sortedBy { if (it.ms != null) it.rank.toLong() else if (it.testedAt == 0L) 50_000_000L else 100_000_000L }
     val shown = if (showAll) list else list.take(60)
+    // Top 20: working servers with the lowest ping and highest measured speed.
+    val top = st.servers.filter { it.ms != null }.sortedBy { it.rank }.take(20)
 
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         item {
-            Field(query, { query = it }, "Search country, host…", Modifier.fillMaxWidth(), leading = TIcons.search)
+            Segmented(listOf("top" to "Top 20", "all" to "All servers"), view) { view = it }
         }
-        item {
-            CountryPicker(country, countryList(st), "All countries") { country = it }
+        if (view == "all") {
+            item {
+                Field(query, { query = it }, "Search country, host…", Modifier.fillMaxWidth(), leading = TIcons.search)
+            }
+            item {
+                CountryPicker(country, countryList(st), "All countries") { country = it }
+            }
         }
         item {
             PrimaryButton(if (busy) "Testing…" else "Find fastest servers", Modifier.fillMaxWidth().padding(top = 4.dp), enabled = !busy) {
@@ -77,6 +86,7 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
             val freeLine = when {
                 fs.state == "loading" -> "Downloading free server lists…"
                 fs.state == "testing" -> "Testing free servers… ${fs.progress}% · ${fs.working} working so far"
+                fs.state == "speed" -> "Measuring download speed of the best servers…"
                 fs.error.isNotEmpty() -> fs.error
                 fs.at > 0 -> "${st.free.count { it.ms != null }} fast free servers ready (checked ${fs.found}). " +
                     "Updated ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(fs.at))} · refreshes every 30 min."
@@ -117,11 +127,21 @@ fun ServersScreen(st: AppState, goHome: () -> Unit) {
         item {
             ServerRow(null, st.prefs.selected == "auto") { Core.select("auto"); goHome() }
         }
-        items(shown, key = { it.id }) { s ->
-            ServerRow(s, st.prefs.selected == s.id) { Core.select(s.id); goHome() }
-        }
-        if (list.size > shown.size) item {
-            GhostButton("Show all ${list.size} servers", Modifier.fillMaxWidth()) { showAll = true }
+        if (view == "top") {
+            if (top.isEmpty()) item {
+                Muted("The best servers show up here after the first test: lowest ping and highest download speed first.",
+                    Modifier.fillMaxWidth().padding(12.dp), center = true)
+            }
+            itemsIndexed(top, key = { _, s -> "top-" + s.id }) { i, s ->
+                ServerRow(s, st.prefs.selected == s.id, rank = i + 1) { Core.select(s.id); goHome() }
+            }
+        } else {
+            items(shown, key = { it.id }) { s ->
+                ServerRow(s, st.prefs.selected == s.id) { Core.select(s.id); goHome() }
+            }
+            if (list.size > shown.size) item {
+                GhostButton("Show all ${list.size} servers", Modifier.fillMaxWidth()) { showAll = true }
+            }
         }
         if (st.servers.isEmpty()) item {
             Muted("Finding free servers for you… this takes about 30 seconds the first time.", Modifier.fillMaxWidth().padding(12.dp), center = true)

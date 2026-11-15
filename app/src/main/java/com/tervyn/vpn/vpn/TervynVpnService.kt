@@ -17,6 +17,8 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.tervyn.vpn.R
 import com.tervyn.vpn.core.Core
+import com.tervyn.vpn.core.formatBytes
+import com.tervyn.vpn.core.formatRate
 import com.tervyn.vpn.ui.MainActivity
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -46,7 +48,7 @@ class TervynVpnService : VpnService() {
 
     private val tunLock = Any()
     private var tun: ParcelFileDescriptor? = null
-    private var engine: TunEngine? = null
+    @Volatile private var engine: TunEngine? = null
     private val listener: () -> Unit = { updateNotification() }
 
     override fun onCreate() {
@@ -108,6 +110,9 @@ class TervynVpnService : VpnService() {
         updateNotification()
     }
 
+    /** (download, upload) bytes through the VPN so far, or null when the tunnel isn't running. */
+    fun trafficBytes(): Pair<Long, Long>? = engine?.let { it.bytesDown.get() to it.bytesUp.get() }
+
     fun stopTunnel() {
         synchronized(tunLock) { stopEngineLocked() }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -154,11 +159,15 @@ class TervynVpnService : VpnService() {
             st.on -> if (st.prefs.targeted) "Your sites are protected" else "Protected connection"
             else -> "Connecting…"
         }
+        val showSpeed = st.on && st.prefs.speedInNotification
         val text = when {
+            // Live speed, updated every second.
+            showSpeed -> "↓ ${formatRate(st.traffic.down)}   ↑ ${formatRate(st.traffic.up)}"
             st.on -> st.status.label + if (st.prefs.targeted) " · ${st.prefs.sites.size} sites" else ""
-            st.freeStatus.state == "testing" -> "Finding fast free servers… ${st.freeStatus.progress}%"
-            else -> "Finding fast free servers…"
+            st.freeStatus.state == "testing" -> "Finding fast servers… ${st.freeStatus.progress}%"
+            else -> "Finding fast servers…"
         }
+        val sub = if (showSpeed) st.status.label + " · " + formatBytes(st.traffic.totalDown + st.traffic.totalUp) + " used" else null
         val stop = PendingIntent.getService(
             this, 1, Intent(this, TervynVpnService::class.java).setAction(ACTION_DISCONNECT),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -167,9 +176,12 @@ class TervynVpnService : VpnService() {
             .setSmallIcon(R.drawable.ic_stat_vpn)
             .setContentTitle(title)
             .setContentText(text)
+            .setSubText(sub)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setColor(0xFF7B5CFF.toInt())
+            .setSilent(true)
+            .setShowWhen(false)
+            .setColor(0xFF3B82F6.toInt())
             .setContentIntent(openAppIntent())
             .addAction(0, "Disconnect", stop)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -182,17 +194,22 @@ class TervynVpnService : VpnService() {
     }
 
     private var lastShown = ""
+    private var lastSpeed = ""
     private var lastShownAt = 0L
 
     private fun updateNotification() {
         val st = Core.state.value
         if (st.status.state == "off") return
         // Android drops updates that come too fast, so only post real changes, at most once a second.
-        val key = "${st.status.state}|${st.status.label}|${st.freeStatus.state}|${st.freeStatus.progress}|${st.prefs.sites.size}"
+        val base = "${st.status.state}|${st.status.label}|${st.freeStatus.state}|${st.freeStatus.progress}|${st.prefs.sites.size}|${st.prefs.speedInNotification}"
+        val speed = if (st.prefs.speedInNotification) "${st.traffic.down}|${st.traffic.up}" else ""
         val now = System.currentTimeMillis()
         synchronized(this) {
-            if (key == lastShown || (now - lastShownAt < 1000 && st.status.state == "connecting")) return
-            lastShown = key
+            if (base == lastShown && speed == lastSpeed) return
+            // Status changes show at once; speed-only changes at most about once a second.
+            if (base == lastShown && now - lastShownAt < 900) return
+            lastShown = base
+            lastSpeed = speed
             lastShownAt = now
         }
         runCatching { getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification()) }

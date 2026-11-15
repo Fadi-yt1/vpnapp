@@ -78,6 +78,12 @@ object Core {
     @Volatile private var mainXray: XrayProcess? = null
     private val testCounter = AtomicInteger()
 
+    // Live speed: sampled once a second while connected.
+    private val ticker = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "tervyn-traffic").apply { isDaemon = true } }
+    private var lastDown = 0L
+    private var lastUp = 0L
+    private var lastAt = 0L
+
     fun init(context: Context) {
         app = context.applicationContext
         store = Store(app)
@@ -100,6 +106,7 @@ object Core {
             val ver = Regex("Xray ([\\d.]+)").find(v)?.groupValues?.get(1) ?: if (v.isNotBlank()) "?" else ""
             update { it.copy(xrayVersion = ver) }
         }
+        ticker.scheduleWithFixedDelay({ safe { sampleTraffic() } }, 1, 1, TimeUnit.SECONDS)
         sched.scheduleWithFixedDelay({ safe { healthCheck() } }, HEALTH_MIN, HEALTH_MIN, TimeUnit.MINUTES)
         sched.scheduleWithFixedDelay({ safe { periodicRefresh() } }, REFRESH_MIN, REFRESH_MIN, TimeUnit.MINUTES)
     }
@@ -175,11 +182,12 @@ object Core {
         threads: Int = 64,
         stopAfter: Int = Int.MAX_VALUE,
         maxTimeMs: Long = Long.MAX_VALUE,
+        probe: (ProxyEndpoint) -> ProxyTester.Result? = { ProxyTester.test(it) },
         onResult: (Server, ProxyTester.Result?) -> Unit,
     ) {
         val direct = list.filter { !it.isCore }
         val core = list.filter { it.isCore }
-        if (direct.isNotEmpty()) ProxyTester.testMany(direct, threads, stopAfter, maxTimeMs, onResult)
+        if (direct.isNotEmpty()) ProxyTester.testMany(direct, threads, stopAfter, maxTimeMs, probe, onResult)
         if (core.isEmpty()) return
         val bin = xrayBin
         if (bin == null) {
@@ -188,7 +196,7 @@ object Core {
         }
         val main = mainXray
         val inMain = if (main != null && main.alive) core.filter { main.endpoints.containsKey(it.id) } else emptyList()
-        if (inMain.isNotEmpty()) testVia(inMain, main!!.endpoints, threads, onResult)
+        if (inMain.isNotEmpty()) testVia(inMain, main!!.endpoints, threads, probe, onResult)
         for (chunk in (core - inMain.toSet()).chunked(48)) {
             val x = XrayProcess(bin, xrayDir, "test${testCounter.incrementAndGet()}", chunk)
             try {
@@ -199,18 +207,37 @@ object Core {
                 continue
             }
             try {
-                testVia(chunk, x.endpoints, threads, onResult)
+                testVia(chunk, x.endpoints, threads, probe, onResult)
             } finally {
                 x.stop()
             }
         }
     }
 
-    private fun testVia(servers: List<Server>, eps: Map<String, ProxyEndpoint>, threads: Int, onResult: (Server, ProxyTester.Result?) -> Unit) {
+    private fun testVia(
+        servers: List<Server>, eps: Map<String, ProxyEndpoint>, threads: Int,
+        probe: (ProxyEndpoint) -> ProxyTester.Result?, onResult: (Server, ProxyTester.Result?) -> Unit,
+    ) {
         val tagged = servers.mapNotNull { s -> eps[s.id]?.let { Tagged(s, it) } }
         synchronized(ProxyTester) { servers.filter { it.id !in eps }.forEach { onResult(it, null) } } // Xray refused these
-        ProxyTester.testMany(tagged, threads) { t, r -> onResult(t.server, r) }
+        ProxyTester.testMany(tagged, threads, probe = probe) { t, r -> onResult(t.server, r) }
     }
+
+    /**
+     * Measures download speed for the [limit] lowest-delay working servers in
+     * [list] and returns server id -> Mbps (only for those that finished).
+     */
+    private fun measureSpeeds(list: List<Server>, limit: Int = 25): Map<String, Double> {
+        val cand = list.filter { it.ms != null }.sortedBy { it.ms }.take(limit)
+        if (cand.isEmpty()) return emptyMap()
+        val out = HashMap<String, Double>()
+        testServers(cand, threads = 8, probe = { ProxyTester.speedTest(it) }) { s, r -> r?.mbps?.let { out[s.id] = it } }
+        return out
+    }
+
+    /** Puts measured speeds onto the servers they belong to. */
+    private fun withSpeeds(list: List<Server>, speeds: Map<String, Double>) =
+        list.map { s -> speeds[s.id]?.let { s.copy(mbps = it) } ?: s }
 
     // =====================================================================
     // Free servers: find, test, keep the fastest
@@ -272,7 +299,11 @@ object Core {
                     }
                 }
             }
-            val final = working.sortedBy { it.ms }.take(KEEP_FREE)
+            saveFree(working.sortedBy { it.ms }.take(KEEP_FREE))
+            // Download speed of the best ones, so the top servers are fast and not only quick to answer.
+            setFree { it.copy(state = "speed") }
+            val speeds = measureSpeeds(_state.value.free)
+            val final = withSpeeds(_state.value.free, speeds).sortedBy { it.rank }
             saveFree(final)
             val fs = FreeStatus(
                 state = "idle", at = System.currentTimeMillis(), found = pool.size, working = final.size,
@@ -320,6 +351,7 @@ object Core {
             }
             working.sortBy { it.ms }
             saveProxio(working)
+            saveProxio(withSpeeds(_state.value.proxio, measureSpeeds(working)).sortedBy { it.rank })
             val st = ProxioStatus(
                 at = System.currentTimeMillis(), fetched = list.size, working = working.size,
                 error = if (working.isEmpty()) "Proxio.io sent ${list.size} servers, but none answered the speed test. Try again in a few minutes." else "",
@@ -418,6 +450,7 @@ object Core {
                 }
             }
             save(tested)
+            save(withSpeeds(get(_state.value), measureSpeeds(tested)))
             val working = tested.count { it.ms != null }
             val st = ProxioStatus(
                 at = now, fetched = tested.size, working = working,
@@ -568,7 +601,7 @@ object Core {
         }
         fun inCountry(l: List<Server>) = if (prefs.country.isEmpty()) l
             else l.filter { it.code == prefs.country }.ifEmpty { l }
-        fun best(l: List<Server>) = inCountry(l.filter { it.ms != null }).sortedBy { it.ms }.take(maxOf(2, prefs.autoPool))
+        fun best(l: List<Server>) = inCountry(l.filter { it.ms != null }).sortedBy { it.rank }.take(maxOf(2, prefs.autoPool))
 
         when (prefs.source) {
             Prefs.SOURCE_LIST -> {
@@ -767,6 +800,10 @@ object Core {
             }
             activate(applyAutoSwitch(_state.value.prefs, servers))
             svc.startTunnel(fullMode = !prefs.targeted, router = router)
+            if (!wasOn) {
+                lastAt = 0
+                update { it.copy(traffic = Traffic()) }
+            }
             setStatus {
                 Status(state = "on", label = label(_state.value.prefs, chain), serverIds = chain.map { it.id },
                     since = if (wasOn) it.since else System.currentTimeMillis())
@@ -849,13 +886,37 @@ object Core {
             return s
         }
 
-        override fun upstreamDns(): List<InetAddress> {
-            val cm = app.getSystemService(ConnectivityManager::class.java)
-            val net = cm?.activeNetwork   // our own app is outside the VPN, so this is the real network
-            val dns = net?.let { cm.getLinkProperties(it)?.dnsServers }.orEmpty()
-                .filter { it is java.net.Inet4Address && !it.isLoopbackAddress }
-            return dns + listOf(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("8.8.8.8"))
+        override fun forwardDns(query: ByteArray): ByteArray? =
+            com.tervyn.vpn.vpn.DnsClient.query(query, DnsChoice.upstreams(_state.value.prefs, systemDns()))
+
+        override val checksNames: Boolean get() = DnsChoice.checksNames(_state.value.prefs)
+
+        override fun blockedReply(query: ByteArray, name: String): ByteArray? {
+            val now = System.currentTimeMillis()
+            val cached = synchronized(dnsCache) { dnsCache[name]?.takeIf { it.first > now } }
+            val reply = (if (cached != null) cached.second else {
+                val r = com.tervyn.vpn.vpn.DnsClient.query(query, DnsChoice.upstreams(_state.value.prefs, systemDns()))
+                // Only remember real answers; if the provider didn't answer, let the site through.
+                val blocked = r?.takeIf { com.tervyn.vpn.vpn.DnsClient.isBlocked(it) }
+                if (r != null) synchronized(dnsCache) { dnsCache[name] = (now + 10 * 60_000) to blocked }
+                blocked
+            }) ?: return null
+            // Reuse the cached reply with this query's id.
+            return reply.copyOf().also { it[0] = query[0]; it[1] = query[1] }
         }
+    }
+
+    /** Your network's DNS servers (our own app is outside the VPN, so this is the real network). */
+    private fun systemDns(): List<InetAddress> {
+        val cm = app.getSystemService(ConnectivityManager::class.java)
+        val net = cm?.activeNetwork
+        return net?.let { cm.getLinkProperties(it)?.dnsServers }.orEmpty()
+            .filter { it is java.net.Inet4Address && !it.isLoopbackAddress }
+    }
+
+    /** name -> (expires at, provider's blocking reply or null = allowed). */
+    private val dnsCache = object : LinkedHashMap<String, Pair<Long, ByteArray?>>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, ByteArray?>>?) = size > 2000
     }
 
     /** Several failed connections in a short time: check the servers now instead of in 2 minutes. */
@@ -867,6 +928,90 @@ object Core {
             if (failTimes.size >= 3) { failTimes.clear(); true } else false
         }
         if (trigger) bg { healthCheck() }
+    }
+
+    // =====================================================================
+    // Live speed and speed test
+    // =====================================================================
+
+    /** Turns the engine's byte counters into download / upload speed (bytes per second). */
+    private fun sampleTraffic() {
+        val st = _state.value
+        val counters = if (st.on) service?.trafficBytes() else null
+        if (counters == null) {
+            lastAt = 0
+            if (st.traffic.down != 0L || st.traffic.up != 0L) update { it.copy(traffic = it.traffic.copy(down = 0, up = 0)) }
+            return
+        }
+        val (down, up) = counters
+        val now = System.nanoTime()
+        // First sample, or the tunnel was rebuilt (counters start again from 0).
+        if (lastAt == 0L || down < lastDown || up < lastUp) {
+            lastDown = down; lastUp = up; lastAt = now
+            return
+        }
+        val secs = (now - lastAt) / 1e9
+        val dDown = down - lastDown
+        val dUp = up - lastUp
+        lastDown = down; lastUp = up; lastAt = now
+        if (secs <= 0) return
+        update {
+            it.copy(traffic = Traffic(
+                down = (dDown / secs).toLong(), up = (dUp / secs).toLong(),
+                totalDown = it.traffic.totalDown + dDown, totalUp = it.traffic.totalUp + dUp,
+            ))
+        }
+    }
+
+    /** Working servers of the chosen source, best first. */
+    private fun sourcePool(p: Prefs): List<Server> {
+        val s = _state.value
+        val l = when (p.source) {
+            Prefs.SOURCE_OWN -> s.own
+            Prefs.SOURCE_PROXIO -> s.proxio
+            Prefs.SOURCE_CUSTOM -> s.custom
+            Prefs.SOURCE_LIST -> s.list
+            Prefs.SOURCE_BOTH -> s.proxio + s.free
+            else -> s.free
+        }
+        return l.filter { it.ms != null }.sortedBy { it.rank }
+    }
+
+    /** Settings → Connection speed → speed test: the server in use, or the best one when not connected. */
+    fun runSpeedTest() = bg {
+        if (_state.value.speedTest.running) return@bg
+        update { it.copy(speedTest = it.speedTest.copy(running = true, error = "")) }
+        val st = _state.value
+        val target = (if (st.on) chain.firstOrNull() else null) ?: sourcePool(st.prefs).firstOrNull()
+        if (target == null) {
+            update { it.copy(speedTest = SpeedTest(error = "No working server to test yet. Tap \"Find fastest servers\" first.", at = System.currentTimeMillis())) }
+            return@bg
+        }
+        var result: ProxyTester.Result? = null
+        testServers(listOf(target), threads = 1, probe = { ProxyTester.speedTest(it, 3_000_000, 20_000) }) { _, r -> result = r }
+        val r = result
+        val label = "${target.flag} ${if (target.country != "Unknown") target.country else target.name}"
+        update {
+            it.copy(speedTest = SpeedTest(
+                mbps = r?.mbps, ms = r?.ms, server = label, at = System.currentTimeMillis(),
+                error = if (r == null) "The speed test didn't finish. The server may be slow or busy right now; try again." else "",
+            ))
+        }
+        val mbps = r?.mbps ?: return@bg
+        // Remember the result on the server, so the ranking uses it.
+        fun upd(l: List<Server>) = l.map { if (it.id == target.id) it.copy(mbps = mbps) else it }
+        val s2 = _state.value
+        saveFree(upd(s2.free)); saveProxio(upd(s2.proxio)); saveOwn(upd(s2.own)); saveCustom(upd(s2.custom)); saveList(upd(s2.list))
+    }
+
+    fun setShowSpeed(on: Boolean) { savePrefs { it.copy(showSpeed = on) } }
+
+    fun setSpeedInNotification(on: Boolean) { savePrefs { it.copy(speedInNotification = on) } }
+
+    /** Separate DNS: a provider id from [DnsChoice], or [DnsChoice.CUSTOM] with [custom] addresses. */
+    fun setDns(id: String, custom: String = _state.value.prefs.customDns) {
+        savePrefs { it.copy(dns = id, customDns = custom.trim()) }
+        synchronized(dnsCache) { dnsCache.clear() }
     }
 
     // =====================================================================
@@ -1003,6 +1148,8 @@ object Core {
                     }
                 })
             }
+            val speeds = measureSpeeds(_state.value.own.filter { s -> res.containsKey(s.id) })
+            update { st -> st.copy(own = withSpeeds(st.own, speeds)) }
             store.saveOwnServers(_state.value.own)
         } finally {
             val left = testingOwn.decrementAndGet()

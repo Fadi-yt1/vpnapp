@@ -61,6 +61,20 @@ object Core {
     /** With auto-switch off: the server to stay on (saved, so it survives list refreshes). */
     @Volatile private var pinned: Server? = null
 
+    /** Multi-hop: the entry server traffic goes through before the server in use. */
+    @Volatile private var hopEntry: Server? = null
+
+    /** DNS Center: filtering lists, resolver, counters. */
+    lateinit var dns: DnsManager
+        private set
+
+    // Kill switch: after a failure the VPN stays up blocking traffic, and we retry.
+    @Volatile private var retryDelay = 10_000L
+    private var retryTask: java.util.concurrent.ScheduledFuture<*>? = null
+    @Volatile private var pinging = false
+    private var tick = 0L
+    @Volatile private var lastNetwork: android.net.Network? = null
+
     @Volatile private var refreshing: Thread? = null
     @Volatile private var proxioRefreshing: Thread? = null
     private val proxioLock = Object()
@@ -95,6 +109,11 @@ object Core {
             sources = store.sources(), freeStatus = store.freeStatus(),
         )
         pinned = store.pinned()
+        dns = DnsManager(BlockLists(File(app.filesDir, "blocklists")), { systemDns().mapNotNull { it.hostAddress } })
+        dns.resolver.tunnelDial = { h, p -> router.connectProxied(h, p) }
+        update { it.copy(lists = listInfos()) }
+        // A default DNS profile is applied when the app starts.
+        _state.value.prefs.let { p -> p.dnsProfiles.firstOrNull { it.id == p.dnsDefaultProfile }?.let { applyDnsProfile(it.id) } }
         xrayBin = File(app.applicationInfo.nativeLibraryDir, "libxray.so").takeIf { it.exists() }
         bg {
             val bin = xrayBin ?: return@bg
@@ -107,6 +126,10 @@ object Core {
             update { it.copy(xrayVersion = ver) }
         }
         ticker.scheduleWithFixedDelay({ safe { sampleTraffic() } }, 1, 1, TimeUnit.SECONDS)
+        // Filtering lists: download the enabled ones if missing, refresh weekly.
+        bg { refreshLists(force = false) }
+        sched.scheduleWithFixedDelay({ safe { refreshLists(force = true) } }, 7, 7, TimeUnit.DAYS)
+        watchNetwork()
         sched.scheduleWithFixedDelay({ safe { healthCheck() } }, HEALTH_MIN, HEALTH_MIN, TimeUnit.MINUTES)
         sched.scheduleWithFixedDelay({ safe { periodicRefresh() } }, REFRESH_MIN, REFRESH_MIN, TimeUnit.MINUTES)
     }
@@ -559,6 +582,7 @@ object Core {
             saveCustom(upd(_state.value.custom, dropDead = false))
             saveList(upd(_state.value.list, dropDead = false))
             if (dead.isNotEmpty() && !connecting && refreshing == null) {
+                if (inUse.first().id in dead && _state.value.prefs.autoSwitch) setStatus { it.copy(state = "reconnecting") }
                 if (inUse.first().id in dead) {
                     setStatus {
                         it.copy(warning = if (_state.value.prefs.autoSwitch)
@@ -601,7 +625,9 @@ object Core {
         }
         fun inCountry(l: List<Server>) = if (prefs.country.isEmpty()) l
             else l.filter { it.code == prefs.country }.ifEmpty { l }
-        fun best(l: List<Server>) = inCountry(l.filter { it.ms != null }).sortedBy { it.rank }.take(maxOf(2, prefs.autoPool))
+        // Protocol setting: only servers of that protocol (Automatic = any).
+        fun ofProtocol(l: List<Server>) = if (prefs.protocol == Prefs.PROTO_AUTO) l else l.filter { it.proto == prefs.protocol }
+        fun best(l: List<Server>) = inCountry(ofProtocol(l).filter { it.ms != null }).sortedBy { it.rank }.take(maxOf(2, prefs.autoPool))
 
         when (prefs.source) {
             Prefs.SOURCE_LIST -> {
@@ -685,14 +711,18 @@ object Core {
     private fun label(prefs: Prefs, servers: List<Server>): String {
         val first = servers.first()
         val place = if (first.country != "Unknown") first.country else first.name
+        val entry = hopEntry
+        if (entry != null) return "${entry.flag} → ${first.flag} $place"
         return if (prefs.selected == "auto") {
             "${first.flag} $place" + if (servers.size > 1) " + ${servers.size - 1} backup" else ""
         } else "${first.flag} $place"
     }
 
+    private fun protoName(s: Server) = Prefs.PROTOCOLS.firstOrNull { it.first == s.proto }?.second ?: s.proto.uppercase()
+
     /**
      * Makes [servers] the ones in use. Starts (or restarts) Xray when some of
-     * them are VLESS / VMess / Trojan / Shadowsocks servers.
+     * them are VLESS / VMess / Trojan / Shadowsocks / WireGuard servers.
      */
     private fun activate(servers: List<Server>) {
         synchronized(xrayLock) {
@@ -716,7 +746,19 @@ object Core {
             if (usable.isEmpty()) throw IOException("Xray could not use these servers. ${x?.lastError().orEmpty()}".trim())
             chainEndpoints = usable.map { if (it.isCore) x!!.endpoints.getValue(it.id) else it }
             chain = usable
+            hopEntry = pickHopEntry(usable.first())
+            dns.resolver.reset()
         }
+    }
+
+    /**
+     * Multi-hop: the best working plain SOCKS5 / HTTP server in another country
+     * becomes the entry server. Only for plain exit servers (not Xray ones).
+     */
+    private fun pickHopEntry(exit: Server): Server? {
+        if (!_state.value.prefs.multiHop || exit.isCore) return null
+        val pool = _state.value.servers.filter { !it.isCore && it.ms != null && it.id != exit.id }.sortedBy { it.rank }
+        return pool.firstOrNull { it.code.isNotEmpty() && it.code != exit.code } ?: pool.firstOrNull()
     }
 
     private fun pin(s: Server?) {
@@ -736,22 +778,29 @@ object Core {
         return listOf(first)
     }
 
+    private fun connectedStatus(prev: Status, since: Long) = Status(
+        state = "on", label = label(_state.value.prefs, chain), serverIds = chain.map { it.id },
+        since = since, ping = chain.firstOrNull()?.ms ?: prev.ping,
+        protocol = chain.firstOrNull()?.let { protoName(it) } ?: "",
+        hops = hopEntry?.let { "${it.flag} ${it.country} → ${chain.first().flag} ${chain.first().country}" } ?: "",
+    )
+
     /** Switch servers while connected, without dropping the VPN. */
     private fun repick() {
         val prefs = _state.value.prefs
         if (!_state.value.on) return
         val servers = runCatching { applyAutoSwitch(prefs, pickServers(prefs)) }.getOrElse { e ->
-            setStatus { it.copy(warning = e.message ?: e.toString()) }
+            setStatus { it.copy(warning = e.message ?: e.toString(), state = "on") }
             return
         }
         if (servers.isEmpty()) return
         try {
             activate(servers)
         } catch (e: Exception) {
-            setStatus { it.copy(warning = e.message ?: e.toString()) }
+            setStatus { it.copy(warning = e.message ?: e.toString(), state = "on") }
             return
         }
-        setStatus { it.copy(label = label(_state.value.prefs, chain), serverIds = chain.map { s -> s.id }) }
+        setStatus { connectedStatus(it, it.since).copy(warning = it.warning) }
     }
 
     // =====================================================================
@@ -787,40 +836,81 @@ object Core {
 
     private fun doConnect(svc: TervynVpnService) {
         val prefs = savePrefs { it.copy(enabled = true) }
-        val wasOn = _state.value.status.state == "on"
-        if (!wasOn) setStatus { it.copy(state = "connecting", error = "", warning = "") }
+        val before = _state.value.status
+        val wasUp = before.state == "on" || before.state == "reconnecting"
+        if (!wasUp) setStatus { it.copy(state = if (it.state == "failed") "reconnecting" else "connecting", error = "", warning = "") }
         try {
             if (prefs.targeted && prefs.sites.isEmpty()) {
-                throw IOException("\"Only my sites\" is on but the list is empty. Add a site in the Sites tab.")
+                throw IOException("\"Only my sites\" is on but the list is empty. Add a site in Security → Site rules.")
+            }
+            if (prefs.splitMode == Prefs.SPLIT_INCLUDE && prefs.splitApps.isEmpty()) {
+                throw IOException("Split tunneling is set to \"Only selected apps\" but no app is selected.")
             }
             val servers = pickServers(prefs)
             if (!_state.value.prefs.enabled) return   // user pressed stop while we were searching
             if (servers.isEmpty()) {
-                throw IOException("No free server is answering right now. Tap \"Find fastest servers\" in the Servers tab, or try again in a minute.")
+                val proto = Prefs.PROTOCOLS.firstOrNull { it.first == prefs.protocol }?.second
+                throw IOException(if (prefs.protocol != Prefs.PROTO_AUTO) "No working $proto server in this source. Change the protocol to Automatic in Settings → Connection, or add $proto servers."
+                    else "No server is answering right now. Tap \"Find fastest servers\" in Locations, or try again in a minute.")
             }
             activate(applyAutoSwitch(_state.value.prefs, servers))
             svc.startTunnel(fullMode = !prefs.targeted, router = router)
-            if (!wasOn) {
+            cancelRetry()
+            if (!wasUp) {
                 lastAt = 0
-                update { it.copy(traffic = Traffic()) }
+                dns.resetStats()
+                update { it.copy(traffic = Traffic(), history = History()) }
             }
-            setStatus {
-                Status(state = "on", label = label(_state.value.prefs, chain), serverIds = chain.map { it.id },
-                    since = if (wasOn) it.since else System.currentTimeMillis())
-            }
-            update { it.copy(ipText = "") }
+            val since = if (wasUp || before.state == "failed" && before.since > 0) before.since.takeIf { it > 0 } ?: System.currentTimeMillis() else System.currentTimeMillis()
+            setStatus { connectedStatus(it, since) }
+            addRecent(chain.first().id)
+            update { it.copy(ipText = "", ipInfo = null, systemKillSwitch = svc.systemKillSwitch()) }
+            checkIp()
         } catch (e: Exception) {
             Log.w(TAG, "connect failed", e)
-            savePrefs { it.copy(enabled = false) }
-            clearChain()
-            svc.stopTunnel()
-            setStatus { Status(state = "off", error = e.message ?: e.toString()) }
+            if (_state.value.prefs.killSwitch && _state.value.prefs.enabled) {
+                // Kill switch: keep (or put up) the VPN with nothing allowed through, and try again shortly.
+                chain = emptyList()
+                chainEndpoints = emptyList()
+                hopEntry = null
+                val held = runCatching { svc.startTunnel(fullMode = !prefs.targeted, router = router) }.isSuccess
+                setStatus {
+                    it.copy(state = "failed", blocking = held, error = (e.message ?: e.toString()) +
+                        if (held) " Kill switch is on: traffic is blocked until Tervyn reconnects." else "")
+                }
+                scheduleRetry()
+            } else {
+                savePrefs { it.copy(enabled = false) }
+                clearChain()
+                svc.stopTunnel()
+                setStatus { Status(state = "off", error = e.message ?: e.toString()) }
+            }
         }
+    }
+
+    /** Automatic reconnection after a failure: 10 s, 20 s, 40 s … up to 2 minutes. */
+    private fun scheduleRetry() {
+        val delay = retryDelay
+        retryDelay = (retryDelay * 2).coerceAtMost(120_000)
+        synchronized(this) {
+            retryTask?.cancel(false)
+            retryTask = sched.schedule({
+                val svc = service
+                if (svc != null && _state.value.prefs.enabled && _state.value.failed) connect(svc)
+            }, delay, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    private fun cancelRetry() {
+        retryDelay = 10_000
+        synchronized(this) { retryTask?.cancel(false); retryTask = null }
     }
 
     private fun clearChain() {
         chain = emptyList()
         chainEndpoints = emptyList()
+        hopEntry = null
+        dns.resolver.reset()
         synchronized(xrayLock) {
             mainXray?.stop()
             mainXray = null
@@ -830,18 +920,20 @@ object Core {
     /** Stop button, tile, notification, or Android revoked the VPN. */
     fun disconnect() {
         savePrefs { it.copy(enabled = false) }
+        cancelRetry()
         service?.stopTunnel()
         service = null
         bg { clearChain() }
         chain = emptyList()
         chainEndpoints = emptyList()
         setStatus { Status(state = "off") }
-        update { it.copy(ipText = "") }
+        update { it.copy(ipText = "", ipInfo = null) }
     }
 
     fun serviceDestroyed(svc: TervynVpnService) {
         if (service !== svc) return
         service = null
+        cancelRetry()
         bg { clearChain() }
         if (_state.value.status.state != "off") setStatus { Status(state = "off") }
     }
@@ -861,11 +953,15 @@ object Core {
         override fun connectProxied(host: String, port: Int): Socket {
             val eps = chainEndpoints
             if (eps.isEmpty()) throw IOException("VPN is not connected")
+            // With a chosen DNS resolver, connect to the address it gave (else the VPN server looks the name up).
+            val target = dns.resolvedIp(host) ?: host
+            val entry = hopEntry
             var last: IOException? = null
             // Like the browser: if a server fails, try the next one in the chain.
-            for (ep in eps.take(3)) {
+            for ((i, ep) in eps.take(3).withIndex()) {
                 try {
-                    return ProxyDialer.open(ep, host, port, 8000)
+                    return if (entry != null && i == 0) ProxyDialer.openChain(listOf(entry, ep), target, port, 10_000)
+                    else ProxyDialer.open(ep, target, port, 8000)
                 } catch (e: ProxyDeadException) {
                     last = e
                     noteFailure()
@@ -886,23 +982,9 @@ object Core {
             return s
         }
 
-        override fun forwardDns(query: ByteArray): ByteArray? =
-            com.tervyn.vpn.vpn.DnsClient.query(query, DnsChoice.upstreams(_state.value.prefs, systemDns()))
-
-        override val checksNames: Boolean get() = DnsChoice.checksNames(_state.value.prefs)
-
-        override fun blockedReply(query: ByteArray, name: String): ByteArray? {
-            val now = System.currentTimeMillis()
-            val cached = synchronized(dnsCache) { dnsCache[name]?.takeIf { it.first > now } }
-            val reply = (if (cached != null) cached.second else {
-                val r = com.tervyn.vpn.vpn.DnsClient.query(query, DnsChoice.upstreams(_state.value.prefs, systemDns()))
-                // Only remember real answers; if the provider didn't answer, let the site through.
-                val blocked = r?.takeIf { com.tervyn.vpn.vpn.DnsClient.isBlocked(it) }
-                if (r != null) synchronized(dnsCache) { dnsCache[name] = (now + 10 * 60_000) to blocked }
-                blocked
-            }) ?: return null
-            // Reuse the cached reply with this query's id.
-            return reply.copyOf().also { it[0] = query[0]; it[1] = query[1] }
+        override fun handleDns(query: ByteArray, q: com.tervyn.vpn.vpn.Dns.Question, proxied: Boolean, fake: (String) -> Int): ByteArray? {
+            val st = _state.value
+            return dns.handle(query, q, proxied, st.prefs.dns, chainEndpoints.isNotEmpty(), fake)
         }
     }
 
@@ -912,11 +994,6 @@ object Core {
         val net = cm?.activeNetwork
         return net?.let { cm.getLinkProperties(it)?.dnsServers }.orEmpty()
             .filter { it is java.net.Inet4Address && !it.isLoopbackAddress }
-    }
-
-    /** name -> (expires at, provider's blocking reply or null = allowed). */
-    private val dnsCache = object : LinkedHashMap<String, Pair<Long, ByteArray?>>(256, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, ByteArray?>>?) = size > 2000
     }
 
     /** Several failed connections in a short time: check the servers now instead of in 2 minutes. */
@@ -937,7 +1014,15 @@ object Core {
     /** Turns the engine's byte counters into download / upload speed (bytes per second). */
     private fun sampleTraffic() {
         val st = _state.value
+        tick++
         val counters = if (st.on) service?.trafficBytes() else null
+        // DNS counters for the DNS Center (cheap to copy, refreshed every second).
+        if (::dns.isInitialized) {
+            val ds = dns.stats()
+            if (ds != st.dnsStats) update { it.copy(dnsStats = ds) }
+        }
+        // Delay through the server in use, every 15 seconds.
+        if (st.on && tick % 15 == 0L && !pinging) bg { measurePing() }
         if (counters == null) {
             lastAt = 0
             if (st.traffic.down != 0L || st.traffic.up != 0L) update { it.copy(traffic = it.traffic.copy(down = 0, up = 0)) }
@@ -955,11 +1040,28 @@ object Core {
         val dUp = up - lastUp
         lastDown = down; lastUp = up; lastAt = now
         if (secs <= 0) return
+        val downRate = (dDown / secs).toLong()
+        val upRate = (dUp / secs).toLong()
         update {
-            it.copy(traffic = Traffic(
-                down = (dDown / secs).toLong(), up = (dUp / secs).toLong(),
-                totalDown = it.traffic.totalDown + dDown, totalUp = it.traffic.totalUp + dUp,
-            ))
+            it.copy(
+                traffic = Traffic(down = downRate, up = upRate, totalDown = it.traffic.totalDown + dDown, totalUp = it.traffic.totalUp + dUp),
+                history = it.history.copy(down = (it.history.down + downRate).takeLast(60), up = (it.history.up + upRate).takeLast(60)),
+            )
+        }
+    }
+
+    /** Real delay (HTTPS request) through the server in use; shown on Home and in the network monitor. */
+    private fun measurePing() {
+        val eps = chainEndpoints
+        val ep = eps.firstOrNull() ?: return
+        pinging = true
+        try {
+            val entry = hopEntry
+            val r = if (entry != null) null else ProxyTester.test(ep)
+            val ms = r?.ms ?: return
+            update { it.copy(status = it.status.copy(ping = ms), history = it.history.copy(ping = (it.history.ping + ms).takeLast(60))) }
+        } finally {
+            pinging = false
         }
     }
 
@@ -1008,10 +1110,216 @@ object Core {
 
     fun setSpeedInNotification(on: Boolean) { savePrefs { it.copy(speedInNotification = on) } }
 
-    /** Separate DNS: a provider id from [DnsChoice], or [DnsChoice.CUSTOM] with [custom] addresses. */
-    fun setDns(id: String, custom: String = _state.value.prefs.customDns) {
-        savePrefs { it.copy(dns = id, customDns = custom.trim()) }
-        synchronized(dnsCache) { dnsCache.clear() }
+    // ---------- DNS Center ----------
+
+    /** Saves a DNS setup (validated first). Returns an error message, or null when saved. */
+    fun setDnsConfig(cfg: DnsConfig): String? {
+        cfg.validate()?.let { return it }
+        val old = _state.value.prefs.dns
+        savePrefs { it.copy(dns = cfg, dnsProfile = if (it.dnsProfiles.any { p -> p.id == it.dnsProfile && p.config == cfg }) it.dnsProfile else "") }
+        if (old.mode != cfg.mode || old.preset != cfg.preset || old.primary != cfg.primary || old.secondary != cfg.secondary ||
+            old.privateHost != cfg.privateHost || old.privateType != cfg.privateType || old.leakProtection != cfg.leakProtection) dns.clear()
+        if (cfg.filters != old.filters) bg { refreshLists(force = false) }
+        return null
+    }
+
+    fun saveDnsProfile(name: String, id: String? = null): String? {
+        if (name.isBlank()) return "Give the profile a name."
+        val cfg = _state.value.prefs.dns
+        cfg.validate()?.let { return it }
+        val pid = id ?: hashId("dns:" + name + System.currentTimeMillis())
+        savePrefs { p ->
+            val list = p.dnsProfiles.filter { it.id != pid } + DnsProfile(pid, name.trim(), cfg)
+            p.copy(dnsProfiles = list, dnsProfile = pid)
+        }
+        return null
+    }
+
+    fun applyDnsProfile(id: String) {
+        val prof = _state.value.prefs.dnsProfiles.firstOrNull { it.id == id } ?: return
+        savePrefs { it.copy(dns = prof.config, dnsProfile = id) }
+        if (::dns.isInitialized) dns.clear()
+        bg { refreshLists(force = false) }
+    }
+
+    fun deleteDnsProfile(id: String) = savePrefs { p ->
+        p.copy(dnsProfiles = p.dnsProfiles.filter { it.id != id },
+            dnsProfile = if (p.dnsProfile == id) "" else p.dnsProfile,
+            dnsDefaultProfile = if (p.dnsDefaultProfile == id) "" else p.dnsDefaultProfile)
+    }.let { }
+
+    fun setDefaultDnsProfile(id: String) { savePrefs { it.copy(dnsDefaultProfile = if (it.dnsDefaultProfile == id) "" else id) } }
+
+    private fun listInfos(): Map<String, BlockLists.Info> = BlockLists.CATEGORIES.associate { it.id to dns.lists.info(it.id) }
+
+    /** Downloads enabled filtering lists that are missing ([force]: all enabled ones). */
+    fun refreshLists(force: Boolean) {
+        val enabled = _state.value.prefs.dns.filters
+        for (id in enabled) {
+            if (!force && dns.lists.isLoaded(id)) continue
+            if (id in _state.value.listsUpdating) continue
+            update { it.copy(listsUpdating = it.listsUpdating + id) }
+            runCatching { dns.lists.update(id) }.onFailure { Log.w(TAG, "list $id", it) }
+            update { it.copy(listsUpdating = it.listsUpdating - id, lists = listInfos()) }
+        }
+    }
+
+    /** DNS Center → Update lists now. */
+    fun updateListsNow() = bg { refreshLists(force = true) }
+
+    fun setFilter(id: String, on: Boolean) {
+        val cfg = _state.value.prefs.dns
+        setDnsConfig(cfg.copy(filters = if (on) cfg.filters + id else cfg.filters - id))
+    }
+
+    fun setDomainList(block: List<String>, allow: List<String>) {
+        val norm = { l: List<String> -> l.mapNotNull { normalizeSite(it).ifEmpty { null } }.distinct().sorted() }
+        setDnsConfig(_state.value.prefs.dns.copy(blockList = norm(block), allowList = norm(allow)))
+    }
+
+    /** DNS Center → Test: real lookups with the current setup. */
+    fun runDnsTest() = bg {
+        if (_state.value.dnsTest.running) return@bg
+        update { it.copy(dnsTest = it.dnsTest.copy(running = true)) }
+        val st = _state.value
+        val items = runCatching { dns.test(st.prefs.dns, chainEndpoints.isNotEmpty(), !st.prefs.targeted, st.prefs.ipv6Block) }
+            .getOrElse { listOf(DnsManager.TestItem("DNS test", false, it.message ?: it.toString())) }
+        update { it.copy(dnsTest = TestRun(false, System.currentTimeMillis(), items)) }
+    }
+
+    /** Security → Network diagnostics: checks the connection step by step. */
+    fun runDiagnostics() = bg {
+        if (_state.value.diagnostics.running) return@bg
+        update { it.copy(diagnostics = it.diagnostics.copy(running = true)) }
+        val items = ArrayList<DnsManager.TestItem>()
+        fun timed(name: String, block: () -> String): DnsManager.TestItem {
+            val t0 = System.nanoTime()
+            return try {
+                val d = block()
+                DnsManager.TestItem(name, true, d, ((System.nanoTime() - t0) / 1_000_000).toInt())
+            } catch (e: Exception) {
+                DnsManager.TestItem(name, false, e.message ?: e.toString())
+            }
+        }
+        items += timed("Internet connection") {
+            val c = URL("https://connectivitycheck.gstatic.com/generate_204").openConnection() as HttpURLConnection
+            c.connectTimeout = 8000; c.readTimeout = 8000
+            try { if (c.responseCode == 204) "Your network reaches the internet" else throw IOException("HTTP ${c.responseCode}") } finally { c.disconnect() }
+        }
+        val st = _state.value
+        items += DnsManager.TestItem("VPN tunnel", st.on,
+            when { st.on -> "Connected · ${st.status.label} · ${st.status.protocol}"; st.failed -> "Not connected: ${st.status.error}"; else -> "Not connected" })
+        val ep = chainEndpoints.firstOrNull()
+        if (ep != null) {
+            items += timed("VPN server response") {
+                val r = ProxyTester.test(ep) ?: throw IOException("The server didn't answer the secure test page")
+                "Answered over HTTPS in ${r.ms} ms · exit country ${countryName(r.code)}"
+            }
+        }
+        items += timed("Public IP") {
+            checkIpNow()
+            _state.value.ipInfo?.let { "${it.ip} · ${listOf(it.city, it.country).filter { s -> s.isNotBlank() }.joinToString(", ")}" + if (it.viaVpn) " (through VPN)" else " (your network)" }
+                ?: throw IOException(_state.value.ipText)
+        }
+        items += dns.test(st.prefs.dns, chainEndpoints.isNotEmpty(), !st.prefs.targeted, st.prefs.ipv6Block)
+            .filter { it.name.startsWith("IPv4") || it.name.contains("leak") }
+        st.systemKillSwitch?.let { (alwaysOn, lockdown) ->
+            items += DnsManager.TestItem("System kill switch", lockdown,
+                if (lockdown) "Android blocks traffic whenever the VPN is off" else if (alwaysOn) "Always-on VPN is on, but traffic isn't blocked when it's off" else "Always-on VPN is off")
+        }
+        update { it.copy(diagnostics = TestRun(false, System.currentTimeMillis(), items)) }
+    }
+
+    // ---------- Security Center & appearance settings ----------
+
+    /** Settings that need the VPN interface rebuilt when connected. */
+    private fun rebuildTunnel() {
+        val svc = service ?: return
+        if (!_state.value.tunnelUp) return
+        val p = _state.value.prefs
+        bg { runCatching { svc.startTunnel(!p.targeted, router) }.onFailure { e -> setStatus { it.copy(error = e.message ?: e.toString()) } } }
+    }
+
+    fun setKillSwitch(on: Boolean) { savePrefs { it.copy(killSwitch = on) } }
+
+    fun setIpv6Block(on: Boolean) { savePrefs { it.copy(ipv6Block = on) }; rebuildTunnel() }
+
+    fun setSplit(mode: String, apps: List<String>) {
+        savePrefs { it.copy(splitMode = mode, splitApps = apps.distinct()) }
+        rebuildTunnel()
+    }
+
+    fun setAutoConnect(boot: Boolean? = null, launch: Boolean? = null, wifi: Boolean? = null, mobile: Boolean? = null) {
+        savePrefs { p ->
+            p.copy(autoConnectBoot = boot ?: p.autoConnectBoot, autoConnectLaunch = launch ?: p.autoConnectLaunch,
+                autoConnectWifi = wifi ?: p.autoConnectWifi, autoConnectMobile = mobile ?: p.autoConnectMobile)
+        }
+    }
+
+    fun setMultiHop(on: Boolean) {
+        savePrefs { it.copy(multiHop = on) }
+        if (_state.value.on) bg { synchronized(xrayLock) { hopEntry = chain.firstOrNull()?.let { pickHopEntry(it) } }; setStatus { connectedStatus(it, it.since) } }
+    }
+
+    fun setProtocol(proto: String) {
+        savePrefs { it.copy(protocol = proto, selected = if (proto == Prefs.PROTO_AUTO) it.selected else "auto") }
+        if (_state.value.on) bg { repick() }
+    }
+
+    fun toggleFavorite(id: String) {
+        savePrefs { p -> p.copy(favorites = if (id in p.favorites) p.favorites - id else listOf(id) + p.favorites) }
+    }
+
+    private fun addRecent(id: String) {
+        savePrefs { p -> p.copy(recents = (listOf(id) + p.recents.filter { it != id }).take(10)) }
+    }
+
+    fun setTheme(theme: String) { savePrefs { it.copy(theme = theme) } }
+    fun setReducedMotion(on: Boolean) { savePrefs { it.copy(reducedMotion = on) } }
+    fun setBlur(on: Boolean) { savePrefs { it.copy(blur = on) } }
+    fun setHaptics(on: Boolean) { savePrefs { it.copy(haptics = on) } }
+    fun setOnboarded() { savePrefs { it.copy(onboarded = true) } }
+
+    // ---------- network changes ----------
+
+    /**
+     * Wi-Fi / mobile switches: re-check the servers in use (they reach the
+     * internet over the new network), and auto-connect if that's turned on.
+     */
+    private fun watchNetwork() {
+        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    val changed = lastNetwork != null && lastNetwork != network
+                    lastNetwork = network
+                    val st = _state.value
+                    when {
+                        st.on && changed -> bg {
+                            setStatus { it.copy(state = "reconnecting") }
+                            dns.resolver.reset()
+                            healthCheck()
+                            if (_state.value.status.state == "reconnecting") setStatus { it.copy(state = "on") }
+                        }
+                        st.failed && st.prefs.enabled -> service?.let { s -> retryDelay = 10_000; connect(s) }
+                        !st.prefs.enabled && changed -> autoConnectFor(cm.getNetworkCapabilities(network))
+                    }
+                }
+            })
+        }
+    }
+
+    private fun autoConnectFor(caps: android.net.NetworkCapabilities?) {
+        val p = _state.value.prefs
+        val wifi = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        val cell = caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        if ((wifi && p.autoConnectWifi) || (cell && p.autoConnectMobile)) startFromBackground()
+    }
+
+    /** Starts the VPN when permission was given before (Android may refuse from the background). */
+    fun startFromBackground(): Boolean {
+        if (android.net.VpnService.prepare(app) != null) return false
+        return runCatching { TervynVpnService.connect(app) }.isSuccess
     }
 
     // =====================================================================
@@ -1215,17 +1523,23 @@ object Core {
     // Check my IP
     // =====================================================================
 
-    fun checkIp() = bg {
+    fun checkIp() = bg { checkIpNow() }
+
+    /** Public address as websites see it (through the VPN server when connected). */
+    private fun checkIpNow() {
         update { it.copy(ipText = "Checking your IP…") }
-        val text = try {
+        try {
             val eps = chainEndpoints
-            val body = if (_state.value.on && eps.isNotEmpty()) {
+            val viaVpn = _state.value.on && eps.isNotEmpty()
+            val body = if (viaVpn) {
                 // Our own app is outside the VPN, so ask through the VPN server explicitly.
                 var result: String? = null
                 var err: Exception? = null
-                for (ep in eps.take(3)) {
+                val entry = hopEntry
+                for ((i, ep) in eps.take(3).withIndex()) {
                     try {
-                        result = ProxyTester.httpsGet(ProxyDialer.open(ep, IP_CHECK_HOST, 443), IP_CHECK_HOST, "/")
+                        val sock = if (entry != null && i == 0) ProxyDialer.openChain(listOf(entry, ep), IP_CHECK_HOST, 443) else ProxyDialer.open(ep, IP_CHECK_HOST, 443)
+                        result = ProxyTester.httpsGet(sock, IP_CHECK_HOST, "/")
                         break
                     } catch (e: Exception) { err = e }
                 }
@@ -1236,15 +1550,16 @@ object Core {
                 try { c.inputStream.bufferedReader().use { it.readText() } } finally { c.disconnect() }
             }
             val j = JSONObject(body)
-            if (!j.optBoolean("success", true)) "Could not check your IP"
-            else {
-                val where = listOf(j.optString("city"), j.optString("country")).filter { it.isNotBlank() }.joinToString(", ")
-                val flag = j.optJSONObject("flag")?.optString("emoji").orEmpty()
-                "Your IP: ${j.optString("ip")} · $where $flag".trim()
-            }
+            if (!j.optBoolean("success", true)) throw IOException("Could not check your IP")
+            val info = IpInfo(
+                ip = j.optString("ip"), city = j.optString("city"), region = j.optString("region"),
+                country = j.optString("country"), code = j.optString("country_code"),
+                isp = j.optJSONObject("connection")?.optString("isp").orEmpty(), viaVpn = viaVpn, at = System.currentTimeMillis(),
+            )
+            val where = listOf(info.city, info.country).filter { it.isNotBlank() }.joinToString(", ")
+            update { it.copy(ipInfo = info, ipText = "Your IP: ${info.ip} · $where ${flagFromCode(info.code)}".trim()) }
         } catch (e: Exception) {
-            "Could not check your IP: ${e.message}"
+            update { it.copy(ipText = "Could not check your IP: ${e.message}") }
         }
-        update { it.copy(ipText = text) }
     }
 }

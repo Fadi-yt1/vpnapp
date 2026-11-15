@@ -4,478 +4,269 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tervyn.vpn.BuildConfig
 import com.tervyn.vpn.core.AppState
 import com.tervyn.vpn.core.Core
+import com.tervyn.vpn.core.PRESETS
 import com.tervyn.vpn.core.Prefs
-import com.tervyn.vpn.core.DnsChoice
+import com.tervyn.vpn.core.countryName
 import com.tervyn.vpn.core.formatMbps
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.height
-import androidx.compose.ui.Alignment
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import com.tervyn.vpn.core.normalizeSite
 import java.text.DateFormat
 import java.util.Date
 
-val SOURCE_OPTIONS = listOf(
-    Prefs.SOURCE_FREE to "Free public servers",
-    Prefs.SOURCE_PROXIO to "Proxio.io servers (your API key)",
-    Prefs.SOURCE_BOTH to "Proxio.io + free servers",
-    Prefs.SOURCE_OWN to "Your own servers (VLESS, Trojan…)",
-    Prefs.SOURCE_CUSTOM to "Proxy integration (curl / Python / Node.js)",
-    Prefs.SOURCE_LIST to "Proxy list (.txt file)",
-)
-
-/** Example code shown in the empty box (placeholders, not real logins). */
-private val INTEGRATION_EXAMPLES = mapOf(
-    "curl" to "curl --proxy \"http://USER:PASS@1.2.3.4:6014/\" https://ipv4.webshare.io/",
-    "python" to "import requests\nrequests.get(\"https://ipv4.webshare.io/\", proxies={\n  \"http\": \"http://USER:PASS@1.2.3.4:6014/\",\n  \"https\": \"http://USER:PASS@1.2.3.4:6014/\"})",
-    "node" to "axios.get('https://ipv4.webshare.io/', { proxy: {\n  protocol: 'http', host: '1.2.3.4', port: 6014,\n  auth: { username: 'USER', password: 'PASS' } } })",
-)
-
 @Composable
-fun SettingsScreen(st: AppState) {
+fun SettingsScreen(st: AppState, nav: Nav) {
     val ctx = LocalContext.current
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 4.dp)) {
-        SectionLabel("Server source")
-        OptionPicker(st.prefs.source, SOURCE_OPTIONS, Core::setSource)
-        if (st.prefs.source == Prefs.SOURCE_OWN && st.own.isEmpty()) {
-            VSpace(6)
-            Muted("Add your servers under Servers → Advanced: add your own servers.")
+    val p = st.prefs
+    Page("Settings", nav, sub = false) {
+        SectionLabel("Account")
+        GlassCard {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBubble(TIcons.user, size = 44.dp)
+                HSpace(12)
+                Column(Modifier.weight(1f)) {
+                    Text("No account needed", color = C.text, fontWeight = FontWeight.SemiBold)
+                    Muted("Tervyn runs entirely on this phone. Your settings, keys and server lists never leave it.")
+                }
+            }
         }
 
-        VSpace(10)
-        ProxioCard(st)
-        VSpace(10)
-        IntegrationCard(st)
-        VSpace(10)
-        ProxyListCard(st)
-
-        SectionLabel("Connection speed")
-        SpeedSection(st)
+        SectionLabel("Connection")
+        GroupCard {
+            SettingRow(TIcons.servers, "Server sources", sourceName(p.source).replaceFirstChar { it.uppercase() }, onClick = { nav.open(Routes.SOURCES) })
+            RowDivider()
+            SettingRow(TIcons.layers, "Protocol & switching", Prefs.PROTOCOLS.firstOrNull { it.first == p.protocol }?.second ?: p.protocol,
+                onClick = { nav.open(Routes.CONNECTION) })
+            RowDivider()
+            SettingRow(TIcons.sparkle, "Smart Connect", "Fastest server, switches automatically",
+                checked = p.selected == "auto" && p.autoSwitch,
+                onCheckedChange = { if (it) { Core.select("auto"); Core.setAutoSwitch(true) } else Core.setAutoSwitch(false) })
+            RowDivider()
+            SettingRow(TIcons.globe, "Only my sites", if (p.targeted) "${p.sites.size} site(s) use the VPN" else "Off: all apps use the VPN",
+                onClick = { nav.open(Routes.SITES) })
+        }
 
         SectionLabel("DNS")
-        DnsSection(st)
-
-        SectionLabel("Server switching")
-        ToggleRow(
-            "Auto-switch to fastest server",
-            if (st.prefs.autoSwitch) "On: always uses the fastest server, keeps backups ready and switches automatically."
-            else "Off: stays on the selected server and never switches (no backups).",
-            st.prefs.autoSwitch, Core::setAutoSwitch,
-        )
-
-        SectionLabel("Backup servers kept ready")
-        Segmented(listOf("2", "3", "5", "8").map { it to "$it servers" }, st.prefs.autoPool.toString()) {
-            Core.setAutoPool(it.toInt())
-        }
-        VSpace(6)
-        Muted("Auto mode uses the fastest server and switches to a backup instantly if it stops working.")
-
-        SectionLabel("Preferred country")
-        CountryPicker(st.prefs.country, countryList(st), "Any country (fastest)", Core::setCountry)
-
-        SectionLabel("Xray core")
-        Card {
-            if (st.xrayVersion.isNotEmpty()) {
-                Text("Included ✓  Xray ${st.xrayVersion}", color = C.green, fontWeight = FontWeight.SemiBold)
-                VSpace(4)
-                Muted("Your own VLESS, VMess, Trojan and Shadowsocks servers work. Tervyn starts Xray only when one of them is in use or being tested.")
-            } else if (Core.xrayIncluded) {
-                Text("Included", color = C.text, fontWeight = FontWeight.SemiBold)
-            } else {
-                Text("Not included in this build", color = C.amber, fontWeight = FontWeight.SemiBold)
-                VSpace(4)
-                Muted("VLESS / VMess / Trojan / Shadowsocks servers need Xray. Install the APK built by GitHub Actions, which includes it.")
-            }
+        GroupCard {
+            SettingRow(TIcons.dns, "DNS Center", p.dns.label, onClick = { nav.open(Routes.DNS) })
         }
 
-        SectionLabel("Always-on VPN")
-        Card {
-            Text("Connect automatically and block the internet when the VPN is off", color = C.text, fontWeight = FontWeight.SemiBold)
-            VSpace(4)
-            Muted("In Android's VPN settings, tap the gear next to Tervyn VPN and turn on \"Always-on VPN\" (and optionally \"Block connections without VPN\").")
-            VSpace(10)
-            GhostButton("Open VPN settings", Modifier.fillMaxWidth()) {
-                runCatching { ctx.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }
-            }
+        SectionLabel("Security")
+        GroupCard {
+            SettingRow(TIcons.lock, "Kill switch", null, checked = p.killSwitch, onCheckedChange = Core::setKillSwitch)
+            RowDivider()
+            SettingRow(TIcons.apps, "Split tunneling", splitLabel(p), onClick = { nav.open(Routes.SPLIT) })
+            RowDivider()
+            SettingRow(TIcons.wifi, "Auto connect", null, onClick = { nav.open(Routes.AUTOCONNECT) })
+            RowDivider()
+            SettingRow(TIcons.shield, "Security Center", null, onClick = { nav.tab(2) })
         }
 
-        SectionLabel("Quick Settings tile")
-        Card {
-            Muted("Swipe down twice, tap the pencil (edit) and drag \"Tervyn VPN\" into your tiles to connect with one tap.")
+        SectionLabel("Appearance")
+        GroupCard {
+            SettingRow(TIcons.palette, "Theme", if (p.theme == Prefs.THEME_SYSTEM) "Match system" else C.palette.name, onClick = { nav.open(Routes.APPEARANCE) })
         }
 
-        SectionLabel("Privacy and safety")
-        Card {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Muted("• No accounts, ads or tracking. Your settings and API key stay on your phone.")
-                Muted("• Free public servers are run by unknown people. Secure (https) sites stay encrypted end to end, and Tervyn only keeps servers that pass a secure-site check.")
-                Muted("• Avoid banking and other sensitive logins through free servers. \"Only my sites\" mode is the safest way to use them.")
-                Muted("• Video calls and some games use UDP, which these servers can't carry. They fall back to TCP or use your normal connection in \"Only my sites\" mode.")
-            }
+        SectionLabel("General")
+        GroupCard {
+            SettingRow(TIcons.chart, "Live speed on Home", null, checked = p.showSpeed, onCheckedChange = Core::setShowSpeed)
+            RowDivider()
+            SettingRow(TIcons.pulse, "Live speed in notification", null, checked = p.speedInNotification, onCheckedChange = Core::setSpeedInNotification)
+            RowDivider()
+            SettingRow(TIcons.lock, "Always-on VPN", "Android's own setting: keep Tervyn connected",
+                onClick = { runCatching { ctx.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) } })
+            RowDivider()
+            SettingRow(TIcons.apps, "Quick Settings tile", "Swipe down twice → edit → drag \"Tervyn VPN\" into your tiles")
         }
 
-        VSpace(16)
-        Text("Tervyn VPN ${BuildConfig.VERSION_NAME}", color = C.muted, fontSize = 12.sp, modifier = Modifier.fillMaxWidth())
-        VSpace(20)
-    }
-}
-
-@Composable
-private fun ProxioCard(st: AppState) {
-    val cfg = st.proxioConfig
-    val ps = st.proxioStatus
-    val hasKey = cfg.key.isNotBlank()
-    var key by rememberSaveable { mutableStateOf("") }
-    var type by rememberSaveable(cfg.type) { mutableStateOf(cfg.type) }
-    var limit by rememberSaveable(cfg.limit) { mutableStateOf(cfg.limit) }
-    var msg by remember { mutableStateOf("") }
-    var running by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-
-    fun launchWork(work: () -> String) {
-        msg = ""
-        running = true
-        scope.launch {
-            msg = try { withContext(Dispatchers.IO) { work() } } catch (e: Exception) { e.message ?: e.toString() }
-            running = false
-        }
-    }
-
-    Card {
-        Text("Proxio.io API key", color = C.text, fontWeight = FontWeight.SemiBold)
-        VSpace(2)
-        Muted("Use your own Proxio.io servers. The key stays on this phone and is only sent to proxio.io.")
-        VSpace(10)
-        Field(
-            key, { key = it },
-            if (hasKey) "Saved key ${cfg.keyHint} — paste a new one to change" else "Paste your API key",
-            Modifier.fillMaxWidth(), password = true,
-        )
-        VSpace(8)
-        Segmented(listOf("socks5" to "SOCKS5", "http" to "HTTP", "both" to "Both"), type) { type = it }
-        VSpace(8)
-        Segmented(listOf(25, 50, 100, 200).map { it.toString() to "$it servers" }, limit.toString()) { limit = it.toInt() }
-        VSpace(10)
-        val busy = running || ps.busy
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PrimaryButton(if (busy) "Loading…" else "Save & load", Modifier.weight(1.4f), enabled = !busy && (hasKey || key.isNotBlank())) {
-                val k = key
-                key = ""
-                launchWork {
-                    val r = Core.proxioSave(k, type, limit)
-                    if (r.working > 0) "Loaded ${r.working} working servers." else r.error
-                }
-            }
-            if (hasKey) {
-                GhostButton("Reload", Modifier.weight(1f)) {
-                    if (!busy) launchWork { Core.refreshProxio().let { r -> if (r.working > 0) "Loaded ${r.working} working servers." else r.error } }
-                }
-                GhostButton("Remove", Modifier.weight(1f), color = C.red) {
-                    if (!busy) { Core.proxioRemove(); key = ""; msg = "API key removed." }
-                }
-            }
-        }
-        val line = when {
-            ps.state == "loading" -> "Downloading your Proxio.io list…" to C.muted
-            ps.state == "testing" -> "Testing ${ps.fetched} Proxio.io servers…" to C.muted
-            ps.error.isNotEmpty() && hasKey -> ps.error to C.red
-            hasKey && ps.at > 0 -> "${st.proxio.count { it.ms != null }} of ${ps.fetched} Proxio.io servers working · updated " +
-                DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(ps.at)) to C.green
-            msg.isNotEmpty() -> msg to C.muted
-            else -> "" to C.muted
-        }
-        if (line.first.isNotEmpty()) {
-            VSpace(10)
-            Text(line.first, color = line.second, fontSize = 12.sp)
+        SectionLabel("Support")
+        GroupCard {
+            SettingRow(TIcons.help, "Help", null, onClick = { nav.open(Routes.HELP) })
+            RowDivider()
+            SettingRow(TIcons.eyeOff, "Privacy", null, onClick = { nav.open(Routes.PRIVACY) })
+            RowDivider()
+            SettingRow(TIcons.info, "About Tervyn", "Version ${BuildConfig.VERSION_NAME}", onClick = { nav.open(Routes.ABOUT) })
         }
     }
 }
 
-@Composable
-private fun IntegrationCard(st: AppState) {
-    val cs = st.customStatus
-    val has = st.custom.isNotEmpty()
-    var lang by rememberSaveable { mutableStateOf("curl") }
-    var code by rememberSaveable { mutableStateOf("") }
-    var msg by remember { mutableStateOf("") }
-    var running by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-
-    fun launchWork(work: () -> String) {
-        msg = ""
-        running = true
-        scope.launch {
-            msg = try { withContext(Dispatchers.IO) { work() } } catch (e: Exception) { e.message ?: e.toString() }
-            running = false
-        }
-    }
-
-    Card {
-        Text("Proxy integration", color = C.text, fontWeight = FontWeight.SemiBold)
-        VSpace(2)
-        Muted("Paste the curl, Python or Node.js example from your proxy provider (Webshare, Bright Data, Oxylabs, IPRoyal…). Tervyn finds the proxy address and login in it. The code stays on this phone.")
-        VSpace(10)
-        Segmented(listOf("curl" to "curl", "python" to "Python", "node" to "Node.js"), lang) { lang = it }
-        VSpace(8)
-        Field(
-            code, { code = it },
-            if (has && code.isEmpty()) "Saved: ${st.custom.size} prox${if (st.custom.size == 1) "y" else "ies"}. Paste new code to replace.\n\nExample:\n${INTEGRATION_EXAMPLES[lang]}"
-            else "Example:\n${INTEGRATION_EXAMPLES[lang]}",
-            Modifier.fillMaxWidth(), singleLine = false, minLines = 4,
-        )
-        VSpace(10)
-        val busy = running || cs.busy
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PrimaryButton(if (busy) "Testing…" else "Save & test", Modifier.weight(1.4f), enabled = !busy && code.isNotBlank()) {
-                val c = code
-                launchWork {
-                    val r = Core.customSave(c)
-                    if (r.working > 0) "${r.working} of ${r.fetched} working. Server source is now \"Proxy integration\"." else r.error
-                }
-                code = ""
-            }
-            if (has) {
-                GhostButton("Re-test", Modifier.weight(1f)) {
-                    if (!busy) launchWork { Core.testCustom().let { r -> if (r.working > 0) "${r.working} of ${r.fetched} working." else r.error } }
-                }
-                GhostButton("Remove", Modifier.weight(1f), color = C.red) {
-                    if (!busy) { Core.customRemove(); code = ""; msg = "Removed." }
-                }
-            }
-        }
-        val line = when {
-            cs.state == "testing" -> "Testing ${cs.fetched} prox${if (cs.fetched == 1) "y" else "ies"}…" to C.muted
-            msg.isNotEmpty() -> msg to (if (st.custom.any { it.ms != null }) C.green else C.red)
-            cs.error.isNotEmpty() && has -> cs.error to C.red
-            has && cs.at > 0 -> "${cs.working} of ${cs.fetched} working · tested " +
-                DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(cs.at)) to C.green
-            else -> "" to C.muted
-        }
-        if (line.first.isNotEmpty()) {
-            VSpace(10)
-            Text(line.first, color = line.second, fontSize = 12.sp)
-        }
-        if (has) {
-            VSpace(8)
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (s in st.custom) ProxyRow(s)
-            }
-        }
-    }
-}
+// ---------------------------------------------------------------------------- Connection
 
 @Composable
-private fun ProxyRow(s: com.tervyn.vpn.core.Server) {
-    CardRow {
-        FlagBadge(s.flag, 30)
-        Column(Modifier.weight(1f)) {
-            Text("${s.proto.uppercase()} ${s.hostPort}", color = C.text, fontSize = 13.sp, fontWeight = FontWeight.Medium,
-                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-            Muted(listOfNotNull(
-                s.username.takeIf { it.isNotEmpty() }?.let { "login $it" },
-                s.country.takeIf { it != "Unknown" },
-            ).joinToString(" · ").ifEmpty { "no login" })
-        }
-        PingBadge(s.ms, s.testedAt > 0)
-    }
-}
-
-@Composable
-private fun ProxyListCard(st: AppState) {
-    val ctx = LocalContext.current
-    val ls = st.listStatus
-    val has = st.list.isNotEmpty()
-    var type by rememberSaveable(has) { mutableStateOf(st.list.firstOrNull()?.proto ?: "http") }
-    var pasteOpen by rememberSaveable { mutableStateOf(false) }
-    var paste by rememberSaveable { mutableStateOf("") }
-    var showAll by remember { mutableStateOf(false) }
-    var msg by remember { mutableStateOf("") }
-    var running by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
-
-    fun launchWork(work: () -> String) {
-        msg = ""
-        running = true
-        scope.launch {
-            msg = try { withContext(Dispatchers.IO) { work() } } catch (e: Exception) { e.message ?: e.toString() }
-            running = false
-        }
-    }
-
-    fun importList(text: String, name: String) = launchWork {
-        val r = Core.listImport(text, name, type)
-        "Imported ${r.added} proxies" + (if (r.skipped > 0) " (${r.skipped} lines skipped)" else "") + ". " +
-            if (r.status.working > 0) "${r.status.working} working. Server source is now \"Proxy list\"." else r.status.error
-    }
-
-    val picker = androidx.activity.compose.rememberLauncherForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        val name = runCatching {
-            ctx.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
-                if (c.moveToFirst()) c.getString(0) else null
-            }
-        }.getOrNull() ?: "Proxy list"
-        val text = runCatching {
-            ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().let { b -> b.copyOf(minOf(b.size, 2_000_000)) }.toString(Charsets.UTF_8) }
-        }.getOrNull()
-        if (text == null) msg = "Couldn't read that file." else importList(text, name)
-    }
-
-    Card {
-        Text("Proxy list (.txt)", color = C.text, fontWeight = FontWeight.SemiBold)
-        VSpace(2)
-        Muted("Import the proxy list file from your provider (for example Webshare → Proxy list → Download). One proxy per line, like host:port:user:pass. The list stays on this phone.")
-        VSpace(10)
-        Muted("Type of proxies in the file")
-        VSpace(6)
-        Segmented(listOf("http" to "HTTP", "socks5" to "SOCKS5"), type) { t ->
-            type = t
-            if (has && !running && !ls.busy) launchWork {
-                Core.listSetProto(t).let { r -> if (r.working > 0) "Switched to ${t.uppercase()}: ${r.working} of ${r.fetched} working." else r.error }
-            }
-        }
-        VSpace(10)
-        val busy = running || ls.busy
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PrimaryButton(if (busy) "Testing…" else if (has) "Replace with file…" else "Choose .txt file", Modifier.weight(1.4f), enabled = !busy) {
-                picker.launch(arrayOf("text/*", "application/octet-stream"))
-            }
-            GhostButton(if (pasteOpen) "Hide" else "Paste", Modifier.weight(1f)) { pasteOpen = !pasteOpen }
-        }
-        if (pasteOpen) {
-            VSpace(8)
-            Field(paste, { paste = it }, "1.2.3.4:6014:user:pass\n5.6.7.8:6015:user:pass", Modifier.fillMaxWidth(), singleLine = false, minLines = 4)
-            VSpace(8)
-            PrimaryButton("Import pasted list", Modifier.fillMaxWidth(), enabled = !busy && paste.isNotBlank()) {
-                val t = paste
-                paste = ""
-                pasteOpen = false
-                importList(t, "Pasted list")
-            }
-        }
-        if (has) {
-            VSpace(8)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                GhostButton("Re-test", Modifier.weight(1f)) {
-                    if (!busy) launchWork { Core.testList().let { r -> if (r.working > 0) "${r.working} of ${r.fetched} working." else r.error } }
-                }
-                GhostButton("Remove list", Modifier.weight(1f), color = C.red) {
-                    if (!busy) { Core.listRemove(); msg = "List removed." }
-                }
-            }
-        }
-        val line = when {
-            ls.state == "testing" -> "Testing ${ls.fetched} proxies…" to C.muted
-            msg.isNotEmpty() -> msg to (if (st.list.any { it.ms != null }) C.green else C.red)
-            ls.error.isNotEmpty() && has -> ls.error to C.red
-            has && ls.at > 0 -> "${st.listName.ifEmpty { "Your list" }}: ${ls.working} of ${ls.fetched} working · tested " +
-                DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(ls.at)) to C.green
-            else -> "" to C.muted
-        }
-        if (line.first.isNotEmpty()) {
-            VSpace(10)
-            Text(line.first, color = line.second, fontSize = 12.sp)
-        }
-        if (has) {
-            VSpace(8)
-            val sorted = st.list.sortedBy { it.ms ?: if (it.testedAt == 0L) 50_000 else 100_000 }
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (s in if (showAll) sorted else sorted.take(5)) ProxyRow(s)
-                if (!showAll && sorted.size > 5) GhostButton("Show all ${sorted.size} proxies", Modifier.fillMaxWidth()) { showAll = true }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SpeedSection(st: AppState) {
+fun ConnectionScreen(st: AppState, nav: Nav) {
     val p = st.prefs
     val t = st.speedTest
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        ToggleRow(
-            "Live speed on Home", "Download and upload speed while connected, updated every second.",
-            p.showSpeed, Core::setShowSpeed,
+    Page("Protocol & switching", nav, sub = true) {
+        SectionLabel("Protocol")
+        GlassDropdown(p.protocol, Prefs.PROTOCOLS, Core::setProtocol, leading = TIcons.layers)
+        VSpace(6)
+        Muted(
+            if (p.protocol == Prefs.PROTO_AUTO) "Automatic uses the best working server of any protocol your sources provide."
+            else "Only ${Prefs.PROTOCOLS.first { it.first == p.protocol }.second} servers are used. Add them in Server sources if you have none.",
+            Modifier.padding(horizontal = 6.dp),
         )
-        ToggleRow(
-            "Live speed in notification", "Shows ↓ download and ↑ upload in the VPN notification, updated every second.",
-            p.speedInNotification, Core::setSpeedInNotification,
-        )
-        Card {
-            Text("Speed test", color = C.text, fontWeight = FontWeight.SemiBold)
-            VSpace(2)
+
+        SectionLabel("Switching")
+        GroupCard {
+            SettingRow(TIcons.sparkle, "Auto-switch to fastest server",
+                if (p.autoSwitch) "Keeps backups ready and switches instantly if a server stops working" else "Stays on the selected server",
+                checked = p.autoSwitch, onCheckedChange = Core::setAutoSwitch)
+            RowDivider()
+            SettingRow(TIcons.route, "Multi-hop", "Route through a second server first (SOCKS5 / HTTP servers)",
+                checked = p.multiHop, onCheckedChange = Core::setMultiHop)
+        }
+        SectionLabel("Backup servers kept ready")
+        GlassTabBar(listOf("2", "3", "5", "8").map { it to it }, p.autoPool.toString(), { Core.setAutoPool(it.toInt()) })
+
+        SectionLabel("Preferred country")
+        CountryPicker(p.country, countryList(st), "Any country (fastest)", Core::setCountry)
+        if (p.country.isNotEmpty()) { VSpace(6); Muted("Smart Connect only uses servers in ${countryName(p.country)}.", Modifier.padding(horizontal = 6.dp)) }
+
+        SectionLabel("Speed test")
+        GlassCard {
             Muted(if (st.on) "Measures download speed through the server you're connected to." else "Measures download speed of the best server for your source.")
             VSpace(12)
             Row(verticalAlignment = Alignment.Bottom) {
-                Text(t.mbps?.let { formatMbps(it) } ?: "—", color = C.text, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                Text(t.mbps?.let { formatMbps(it) } ?: "—", color = C.text, fontSize = 32.sp, fontWeight = FontWeight.Bold, fontFamily = Fonts.display)
                 HSpace(10)
                 if (t.ms != null) Muted("${t.ms} ms to first byte", Modifier.padding(bottom = 6.dp))
             }
             if (t.server.isNotEmpty()) Muted("${t.server} · " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(t.at)))
             if (t.error.isNotEmpty()) { VSpace(6); Text(t.error, color = C.red, fontSize = 12.sp) }
             VSpace(12)
-            PrimaryButton(if (t.running) "Testing…" else "Run speed test", Modifier.fillMaxWidth(), enabled = !t.running) { Core.runSpeedTest() }
+            GlassButton(if (t.running) "Testing…" else "Run speed test", Modifier.fillMaxWidth(), icon = TIcons.bolt, loading = t.running, enabled = !t.running) { Core.runSpeedTest() }
+        }
+
+        SectionLabel("Xray core")
+        GlassCard {
+            if (st.xrayVersion.isNotEmpty()) {
+                Text("Included · Xray ${st.xrayVersion}", color = C.green, fontWeight = FontWeight.SemiBold)
+                VSpace(4)
+                Muted("WireGuard, VLESS, VMess, Trojan and Shadowsocks servers work. Xray runs only while one of them is in use or being tested.")
+            } else if (Core.xrayIncluded) {
+                Text("Included", color = C.text, fontWeight = FontWeight.SemiBold)
+            } else {
+                Text("Not included in this build", color = C.amber, fontWeight = FontWeight.SemiBold)
+                VSpace(4)
+                Muted("WireGuard / VLESS / VMess / Trojan / Shadowsocks need Xray. Install the APK built by GitHub Actions, which includes it.")
+            }
         }
     }
 }
 
+// ---------------------------------------------------------------------------- Sites
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun DnsSection(st: AppState) {
-    val p = st.prefs
-    var custom by rememberSaveable(p.customDns) { mutableStateOf(p.customDns) }
-    val options = listOf(Triple(DnsChoice.AUTO, "Automatic", "VPN sites are looked up by the VPN server; others by your network")) +
-        DnsChoice.PROVIDERS.map { Triple(it.id, it.name, it.about) } +
-        Triple(DnsChoice.CUSTOM, "Custom", "Your own DNS server")
-    Card(padding = PaddingValues(vertical = 6.dp)) {
-        options.forEachIndexed { i, (id, name, about) ->
-            Row(
-                Modifier.fillMaxWidth().clickable { Core.setDns(id, custom) }.padding(horizontal = 16.dp, vertical = 11.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                RadioDot(p.dns == id)
-                HSpace(12)
-                Column(Modifier.weight(1f)) {
-                    Text(name, color = C.text, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                    Text(about, color = C.muted, fontSize = 11.sp)
-                }
-            }
-            if (i < options.size - 1) Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp).height(1.dp).background(C.border))
+fun SitesScreen(st: AppState, nav: Nav) {
+    var input by rememberSaveable { mutableStateOf("") }
+    var error by rememberSaveable { mutableStateOf("") }
+    val prefs = st.prefs
+
+    fun add() {
+        val list = input.split(Regex("[\\s,]+")).filter { it.isNotBlank() }
+        if (list.isEmpty()) return
+        if (list.none { normalizeSite(it).isNotEmpty() }) {
+            error = "That doesn't look like a website address. Example: youtube.com"
+            return
         }
+        error = ""
+        Core.addSites(list)
+        input = ""
     }
-    if (p.dns == DnsChoice.CUSTOM) {
+
+    Page("Only my sites", nav, sub = true, subtitle = "Just these sites use the VPN, in every app") {
+        GlassTabBar(listOf(Prefs.MODE_FULL to "All apps", Prefs.MODE_TARGETED to "Only my sites"), prefs.mode, Core::setMode)
         VSpace(10)
+        Muted(if (prefs.targeted) "Only the sites below go through the VPN. Everything else uses your normal connection. Subdomains are included."
+            else "You're in \"All apps\" mode, so everything is protected. Switch to \"Only my sites\" to protect just the sites below.",
+            Modifier.padding(horizontal = 6.dp))
+        VSpace(12)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Field(custom, { custom = it }, "1.1.1.1, 8.8.8.8 or https://…/dns-query", Modifier.weight(1f))
-            PrimaryButton("Save", enabled = custom.isNotBlank() && custom.trim() != p.customDns) { Core.setDns(DnsChoice.CUSTOM, custom) }
+            GlassInput(
+                input, { input = it }, "example.com", Modifier.weight(1f), leading = TIcons.globe,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { add() }),
+            )
+            GlassButton("Add", enabled = input.isNotBlank()) { add() }
+        }
+        if (error.isNotEmpty()) Alert(error) { error = "" }
+        VSpace(6)
+        Muted("Tip: in any browser or app, tap Share → Tervyn VPN to add that site.", Modifier.padding(horizontal = 6.dp))
+
+        SectionLabel("Quick add")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (pr in PRESETS) {
+                val added = pr.domains.all { it in prefs.sites }
+                Chip(pr.name, added) { if (added) Core.removeSites(pr.domains) else Core.addSites(pr.domains) }
+            }
+        }
+
+        SectionLabel("Your sites" + if (prefs.sites.isNotEmpty()) " (${prefs.sites.size})" else "")
+        if (prefs.sites.isEmpty()) Muted("No sites yet. Add one above or use Quick add.", Modifier.padding(horizontal = 6.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (d in prefs.sites) SiteRow(d) { Core.removeSites(listOf(d)) }
         }
     }
-    VSpace(8)
-    Muted("Chosen providers are used over encrypted DNS (DNS over HTTPS). AdGuard, Quad9 and Cloudflare Family also block what they filter, in every app that goes through the VPN.")
+}
+
+// ---------------------------------------------------------------------------- Help / privacy / about
+
+@Composable
+fun InfoScreen(kind: String, nav: Nav) {
+    val (title, blocks) = when (kind) {
+        Routes.HELP -> "Help" to listOf(
+            "Connecting" to "Tap the orb on Home. The first time, Android asks you to allow Tervyn to set up a VPN. Smart Connect picks the fastest working server; turn it off to stay on a server you chose in Locations.",
+            "Servers" to "Free public servers are found and tested automatically. For steadier connections add your own servers (WireGuard, VLESS, VMess, Trojan, Shadowsocks, SOCKS5, HTTP), a Proxio.io API key, a proxy list file or your provider's curl / Python / Node.js example in Settings → Server sources.",
+            "Only my sites" to "Protects just the sites you list, in every app. Everything else uses your normal connection — useful with free servers.",
+            "Kill switch" to "If the VPN server stops working, Tervyn keeps apps blocked until it reconnects. For protection while Tervyn itself is closed, turn on Always-on VPN and \"Block connections without VPN\" in Android's VPN settings.",
+            "DNS" to "DNS Center lets you choose who answers your apps' lookups, encrypt them, keep them inside the tunnel, block ads, trackers, malware and phishing, and save setups as profiles. Use Test to check it.",
+            "Video calls and games" to "Most servers carry TCP only. Apps using UDP (calls, some games) fall back to TCP, or use your normal connection in \"Only my sites\" mode. WireGuard servers carry everything.",
+            "Something isn't working" to "Open Security → Network diagnostics and run it: it checks each step and tells you which one fails.",
+        )
+        Routes.PRIVACY -> "Privacy" to listOf(
+            "No account, no tracking" to "Tervyn has no sign-up, no analytics and no ads. Nothing about you or your browsing is sent to us — there is no Tervyn server.",
+            "Stays on your phone" to "Your settings, API keys, proxy logins, server lists and DNS profiles are stored only in the app's private storage.",
+            "Who sees your traffic" to "The VPN server you use sees which sites you visit (secure https sites stay encrypted end to end). Free public servers are run by unknown people: avoid banking and other sensitive logins through them.",
+            "What Tervyn downloads" to "Free server lists and DNS blocklists from public GitHub repositories, your Proxio.io list when you add a key, and your public IP from ipwho.is when you check it.",
+            "Permissions" to "VPN (to route traffic), notifications (connection status), start at boot (only if you turn on auto connect), and the list of installed apps (only shown in Split tunneling, never sent anywhere).",
+        )
+        else -> "About" to listOf(
+            "Tervyn VPN ${BuildConfig.VERSION_NAME}" to "A private, account-free VPN app with liquid glass design.",
+            "Open source components" to "Xray-core (MPL 2.0) for WireGuard, VLESS, VMess, Trojan and Shadowsocks. Haze (Apache 2.0) for background blur. Sora and Inter fonts (SIL Open Font License). World map from Natural Earth (public domain); country positions from Google DSPL (CC BY 4.0).",
+            "Blocklists" to "Ads: anudeepND, StevenBlack. Tracking: Perflyst, HaGeZi. Malware: HaGeZi Threat Intelligence. Phishing: RPiList. Each list keeps its own licence.",
+        )
+    }
+    Page(title, nav, sub = true) {
+        for ((h, body) in blocks) {
+            GlassCard {
+                Text(h, color = C.text, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                VSpace(6)
+                Text(body, color = C.muted, fontSize = 13.5.sp, lineHeight = 19.sp)
+            }
+            VSpace(10)
+        }
+    }
 }

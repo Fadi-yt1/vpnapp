@@ -121,6 +121,69 @@ object Dns {
         return Question(sb.toString().lowercase(), Ip.u16(m, i), i + 4)
     }
 
+    /** A standard query for [name] / [type] (recursion desired). */
+    fun buildQuery(name: String, type: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val id = (System.nanoTime() and 0xffff).toInt()
+        out.write(byteArrayOf((id ushr 8).toByte(), id.toByte(), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0))
+        for (l in name.trimEnd('.').split('.')) { out.write(l.length); out.write(l.toByteArray()) }
+        out.write(byteArrayOf(0, (type ushr 8).toByte(), type.toByte(), 0, 1))
+        return out.toByteArray()
+    }
+
+    fun answerCount(m: ByteArray): Int = if (m.size >= 12) Ip.u16(m, 6) else 0
+
+    /** Reply for a blocked name: A -> 0.0.0.0, AAAA -> ::, anything else -> no records. */
+    fun blocked(query: ByteArray, q: Question): ByteArray {
+        if (q.type == AAAA) {
+            val base = reply(query, q, null)
+            val out = ByteArray(base.size + 28)
+            System.arraycopy(base, 0, out, 0, base.size)
+            Ip.put16(out, 6, 1)
+            var o = base.size
+            out[o++] = 0xC0.toByte(); out[o++] = 0x0C
+            Ip.put16(out, o, AAAA); o += 2
+            Ip.put16(out, o, 1); o += 2
+            Ip.put32(out, o, 60); o += 4
+            Ip.put16(out, o, 16)   // 16 zero bytes follow: ::
+            return out
+        }
+        return reply(query, q, if (q.type == A) 0 else null)
+    }
+
+    /** "Server failure" reply, so apps fail fast instead of waiting. */
+    fun servfail(query: ByteArray, q: Question): ByteArray =
+        reply(query, q, null).also { it[3] = (0x80 or 2).toByte() }
+
+    /** Lowest TTL in the answer section (seconds), or null if there are no answers. */
+    fun minTtl(m: ByteArray): Int? {
+        try {
+            val qd = Ip.u16(m, 4)
+            val an = Ip.u16(m, 6)
+            if (an == 0) return null
+            var i = 12
+            fun skipName() {
+                while (true) {
+                    val l = m[i].toInt() and 0xff
+                    if (l == 0) { i += 1; return }
+                    if (l and 0xC0 == 0xC0) { i += 2; return }
+                    i += 1 + l
+                }
+            }
+            repeat(qd) { skipName(); i += 4 }
+            var min = Int.MAX_VALUE
+            repeat(an) {
+                skipName()
+                val ttl = Ip.i32(m, i + 4)
+                if (ttl in 0 until min) min = ttl
+                i += 10 + Ip.u16(m, i + 8)
+            }
+            return if (min == Int.MAX_VALUE) null else min
+        } catch (_: IndexOutOfBoundsException) {
+            return null
+        }
+    }
+
     /** IPv4 addresses in the answer section of a reply. */
     fun answerIps(m: ByteArray): List<Int> {
         val out = ArrayList<Int>()

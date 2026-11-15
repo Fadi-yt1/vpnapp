@@ -32,10 +32,19 @@ data class CoreSpec(
     val verifyName: String = "",         // vcn= : name to check the certificate against
     val flow: String = "",
     val extra: JSONObject? = null,
+    // WireGuard
+    val wgSecretKey: String = "",
+    val wgPublicKey: String = "",
+    val wgPresharedKey: String = "",
+    val wgAddress: List<String> = emptyList(),
+    val wgMtu: Int = 0,
+    val wgReserved: List<Int> = emptyList(),
+    val wgKeepAlive: Int = 0,
 ) {
     /** Transports and settings this app's Xray config builder handles. */
     val supported: Boolean
         get() = when {
+            proto == "wireguard" -> wgSecretKey.isNotEmpty() && wgPublicKey.isNotEmpty()
             proto == "shadowsocks" -> method.isNotEmpty()
             net !in SUPPORTED_NETS -> false
             security == "reality" && pbk.isEmpty() -> false
@@ -45,6 +54,7 @@ data class CoreSpec(
     /** "tcp+reality", "ws+tls", … for the server list. */
     val transport: String
         get() {
+            if (proto == "wireguard") return "udp"
             if (proto == "shadowsocks") return "tcp"
             val n = if (net == "raw") "tcp" else net
             return if (security != "none" && security.isNotEmpty()) "$n+$security" else n
@@ -75,6 +85,15 @@ object Links {
         val out = LinkedHashMap<String, Server>()
         var skipped = 0
         var title: String? = null
+        // WireGuard configuration files ([Interface] … [Peer] …), possibly several.
+        if (text.contains("[Interface]", ignoreCase = true)) {
+            for (block in wireGuardBlocks(text)) {
+                val link = wireGuardLink(block)
+                val s = link?.let { runCatching { parseLine(it, sourceId) }.getOrNull() }
+                if (s == null) skipped++ else out[s.id] = s
+            }
+            text = text.lines().filter { it.trim().contains("://") }.joinToString("\n")
+        }
         for (raw in text.lines()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
@@ -140,6 +159,19 @@ object Links {
 
         val p = split(link)
         when (scheme) {
+            "wireguard", "wg" -> {
+                val (address, port) = hostPort(p.hostPort)
+                return CoreSpec(
+                    proto = "wireguard", address = address, port = port, name = p.name,
+                    wgSecretKey = pct(p.user),
+                    wgPublicKey = p.params["publickey"] ?: p.params["publicKey"] ?: "",
+                    wgPresharedKey = p.params["presharedkey"] ?: p.params["preSharedKey"] ?: "",
+                    wgAddress = (p.params["address"] ?: p.params["ip"] ?: "").split(',').map { it.trim() }.filter { it.isNotEmpty() },
+                    wgMtu = p.params["mtu"]?.toIntOrNull() ?: 0,
+                    wgReserved = (p.params["reserved"] ?: "").split(',').mapNotNull { it.trim().toIntOrNull() },
+                    wgKeepAlive = p.params["keepalive"]?.toIntOrNull() ?: 0,
+                )
+            }
             "vless", "trojan" -> {
                 val (address, port) = hostPort(p.hostPort)
                 var s = streamFromParams(p.params, scheme, address, port, p.name)
@@ -169,6 +201,52 @@ object Links {
             }
         }
         return null
+    }
+
+    /** Splits text into wg-quick configs; comment lines right above [Interface] stay with it (they hold the name). */
+    private fun wireGuardBlocks(text: String): List<String> {
+        val blocks = ArrayList<StringBuilder>()
+        val pending = StringBuilder()
+        for (line in text.lines()) {
+            val t = line.trim()
+            when {
+                t.equals("[Interface]", ignoreCase = true) -> {
+                    blocks += StringBuilder(pending).append(line).append('\n'); pending.clear()
+                }
+                t.startsWith("#") && (blocks.isEmpty() || blocks.last().contains("[Peer]")) -> pending.append(line).append('\n')
+                blocks.isNotEmpty() -> blocks.last().append(line).append('\n')
+            }
+        }
+        return blocks.map { it.toString() }.filter { it.contains("[Peer]", ignoreCase = true) }
+    }
+
+    /** A wg-quick configuration -> wireguard:// link (null if something required is missing). */
+    fun wireGuardLink(conf: String): String? {
+        var section = ""
+        val iface = HashMap<String, String>()
+        val peer = HashMap<String, String>()
+        var name = ""
+        for (raw in conf.lines()) {
+            val line = raw.trim()
+            if (line.startsWith("#")) { if (name.isEmpty()) name = line.removePrefix("#").trim(); continue }
+            if (line.startsWith("[")) { section = line.lowercase(); continue }
+            if (!line.contains('=')) continue
+            val k = line.substringBefore('=').trim().lowercase()
+            val v = line.substringAfter('=').trim()
+            if (section == "[interface]") iface[k] = v else if (section == "[peer]" && k !in peer) peer[k] = v
+        }
+        val key = iface["privatekey"] ?: return null
+        val pub = peer["publickey"] ?: return null
+        val endpoint = peer["endpoint"] ?: return null
+        val enc = { s: String -> java.net.URLEncoder.encode(s, "UTF-8") }
+        val q = buildList {
+            add("publickey=" + enc(pub))
+            peer["presharedkey"]?.let { add("presharedkey=" + enc(it)) }
+            iface["address"]?.let { add("address=" + enc(it.replace(" ", ""))) }
+            iface["mtu"]?.let { add("mtu=$it") }
+            peer["persistentkeepalive"]?.let { add("keepalive=$it") }
+        }.joinToString("&")
+        return "wireguard://${enc(key)}@$endpoint?$q" + if (name.isNotEmpty()) "#" + enc(name).replace("+", "%20") else "#WireGuard"
     }
 
     private fun parseDirect(link: String, scheme: String, sourceId: String): Server? {

@@ -2,6 +2,7 @@ name: Build Android APK
 
 on:
   push:
+    branches-ignore: [screenshots]
   pull_request:
   workflow_dispatch:
 
@@ -63,3 +64,44 @@ jobs:
           name: lint-report
           path: app/build/reports/lint-results-debug.html
           if-no-files-found: ignore
+
+  # Renders every screen in every theme (Paparazzi, no device needed) and
+  # publishes the images to the "screenshots" branch for design review.
+  screenshots:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Render screenshots
+        run: ./gradlew --no-daemon :app:recordPaparazziDebug
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: app/src/test/snapshots/images/
+          if-no-files-found: warn
+
+      - name: Publish to the screenshots branch
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p "$RUNNER_TEMP/shots"
+          cp app/src/test/snapshots/images/*.png "$RUNNER_TEMP/shots/"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan screenshots-publish
+          git rm -rfq .
+          cp "$RUNNER_TEMP/shots/"*.png .
+          git add -- *.png
+          git commit -qm "Screenshots for ${GITHUB_SHA::7}"
+          git push -f origin HEAD:screenshots

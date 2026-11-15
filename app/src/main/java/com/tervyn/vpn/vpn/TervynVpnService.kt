@@ -17,6 +17,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.tervyn.vpn.R
 import com.tervyn.vpn.core.Core
+import com.tervyn.vpn.core.Prefs
 import com.tervyn.vpn.core.formatBytes
 import com.tervyn.vpn.core.formatRate
 import com.tervyn.vpn.ui.MainActivity
@@ -74,19 +75,29 @@ class TervynVpnService : VpnService() {
     /** (Re)builds the VPN interface and starts forwarding packets. Called by Core. */
     fun startTunnel(fullMode: Boolean, router: Router) {
         synchronized(tunLock) {
+            val prefs = Core.state.value.prefs
             val b = Builder()
                 .setSession(getString(R.string.app_name))
                 .setMtu(1500)
                 .addAddress(com.tervyn.vpn.vpn.Ip.str(FakeDns.TUN_IP), 32)
                 .addDnsServer(com.tervyn.vpn.vpn.Ip.str(FakeDns.DNS_IP))
-                .addDisallowedApplication(packageName)   // our own traffic goes around the VPN
                 .setBlocking(true)
                 .setConfigureIntent(openAppIntent())
+            // Split tunneling (Android per-app VPN). Tervyn's own traffic always goes around the VPN.
+            val apps = prefs.splitApps.filter { it != packageName }
+            if (prefs.splitMode == Prefs.SPLIT_INCLUDE && apps.isNotEmpty()) {
+                for (a in apps) runCatching { b.addAllowedApplication(a) }   // apps not listed (and Tervyn) bypass
+            } else {
+                b.addDisallowedApplication(packageName)
+                if (prefs.splitMode == Prefs.SPLIT_EXCLUDE) for (a in apps) runCatching { b.addDisallowedApplication(a) }
+            }
             if (fullMode) {
                 b.addRoute("0.0.0.0", 0)
-                // Capture IPv6 too, so nothing leaks around the VPN (it's dropped; DNS gives IPv4 only).
-                b.addAddress("fd66:7e7e:7e7e::2", 128)
-                b.addRoute("::", 0)
+                if (prefs.ipv6Block) {
+                    // Capture IPv6 too, so nothing leaks around the VPN (it's dropped; DNS gives IPv4 only).
+                    b.addAddress("fd66:7e7e:7e7e::2", 128)
+                    b.addRoute("::", 0)
+                }
                 if (Build.VERSION.SDK_INT >= 33) {
                     // Keep home network devices (printers, TVs, router) reachable.
                     for ((ip, len) in listOf("10.0.0.0" to 8, "172.16.0.0" to 12, "192.168.0.0" to 16, "169.254.0.0" to 16)) {
@@ -109,6 +120,10 @@ class TervynVpnService : VpnService() {
         }
         updateNotification()
     }
+
+    /** Android's own kill switch: (always-on VPN, block connections without VPN). Android 10+. */
+    fun systemKillSwitch(): Pair<Boolean, Boolean>? =
+        if (Build.VERSION.SDK_INT >= 29) runCatching { isAlwaysOn to isLockdownEnabled }.getOrNull() else null
 
     /** (download, upload) bytes through the VPN so far, or null when the tunnel isn't running. */
     fun trafficBytes(): Pair<Long, Long>? = engine?.let { it.bytesDown.get() to it.bytesUp.get() }
@@ -156,13 +171,16 @@ class TervynVpnService : VpnService() {
         }
         val st = Core.state.value
         val title = when {
+            st.reconnecting -> "Reconnecting…"
+            st.failed -> if (st.status.blocking) "Kill switch on · traffic blocked" else "Connection failed"
             st.on -> if (st.prefs.targeted) "Your sites are protected" else "Protected connection"
             else -> "Connecting…"
         }
         val showSpeed = st.on && st.prefs.speedInNotification
         val text = when {
             // Live speed, updated every second.
-            showSpeed -> "↓ ${formatRate(st.traffic.down)}   ↑ ${formatRate(st.traffic.up)}"
+            st.failed -> "Trying again shortly… tap Disconnect to stop"
+            showSpeed -> "↓ ${formatRate(st.traffic.down)}   ↑ ${formatRate(st.traffic.up)}" + (st.status.ping?.let { "   ·  $it ms" } ?: "")
             st.on -> st.status.label + if (st.prefs.targeted) " · ${st.prefs.sites.size} sites" else ""
             st.freeStatus.state == "testing" -> "Finding fast servers… ${st.freeStatus.progress}%"
             else -> "Finding fast servers…"

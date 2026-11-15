@@ -61,7 +61,7 @@ data class Server(
             mbps = if (o.has("mbps")) o.getDouble("mbps") else null,
         )
 
-        val CORE_PROTOS = setOf("vless", "vmess", "trojan", "shadowsocks")
+        val CORE_PROTOS = setOf("vless", "vmess", "trojan", "shadowsocks", "wireguard")
         const val PROXIO_SOURCE = "proxio"
 
         fun make(
@@ -90,8 +90,31 @@ data class Prefs(
     val autoSwitch: Boolean = true,     // true: always use the fastest server and switch automatically
     val showSpeed: Boolean = true,      // live download / upload speed on the Home screen
     val speedInNotification: Boolean = true,
-    val dns: String = DnsChoice.AUTO,   // DNS provider id (see DnsChoice)
-    val customDns: String = "",         // IP address(es) or https:// DoH address, for dns = "custom"
+    // DNS Center
+    val dns: DnsConfig = DnsConfig(),
+    val dnsProfiles: List<DnsProfile> = emptyList(),
+    val dnsProfile: String = "",        // id of the profile in use ("" = none)
+    val dnsDefaultProfile: String = "",
+    // Security Center
+    val killSwitch: Boolean = true,     // on connection failure keep the VPN up and block traffic
+    val ipv6Block: Boolean = true,      // capture and block IPv6 so it can't bypass the VPN
+    val splitMode: String = SPLIT_ALL,  // SPLIT_ALL, SPLIT_EXCLUDE (selected apps bypass), SPLIT_INCLUDE (only selected apps)
+    val splitApps: List<String> = emptyList(),
+    val autoConnectBoot: Boolean = false,
+    val autoConnectLaunch: Boolean = false,
+    val autoConnectWifi: Boolean = false,
+    val autoConnectMobile: Boolean = false,
+    val multiHop: Boolean = false,
+    val protocol: String = PROTO_AUTO,  // PROTO_AUTO or one protocol (socks5, http, vless, vmess, trojan, shadowsocks, wireguard)
+    // Locations
+    val favorites: List<String> = emptyList(),
+    val recents: List<String> = emptyList(),
+    // Appearance & general
+    val theme: String = THEME_PURPLE,   // THEME_SYSTEM, THEME_LIGHT, THEME_DARK, THEME_PURPLE
+    val reducedMotion: Boolean = false,
+    val blur: Boolean = true,           // real background blur (Android 12+)
+    val haptics: Boolean = true,
+    val onboarded: Boolean = false,
 ) {
     val targeted get() = mode == MODE_TARGETED
     val usesFree get() = source == SOURCE_FREE || source == SOURCE_BOTH
@@ -103,7 +126,17 @@ data class Prefs(
         put("source", source)
         put("autoSwitch", autoSwitch)
         put("showSpeed", showSpeed); put("speedInNotification", speedInNotification)
-        put("dns", dns); put("customDns", customDns)
+        put("dnsConfig", dns.toJson())
+        put("dnsProfiles", JSONArray(dnsProfiles.map { it.toJson() }))
+        put("dnsProfile", dnsProfile); put("dnsDefaultProfile", dnsDefaultProfile)
+        put("killSwitch", killSwitch); put("ipv6Block", ipv6Block)
+        put("splitMode", splitMode); put("splitApps", JSONArray(splitApps))
+        put("autoConnectBoot", autoConnectBoot); put("autoConnectLaunch", autoConnectLaunch)
+        put("autoConnectWifi", autoConnectWifi); put("autoConnectMobile", autoConnectMobile)
+        put("multiHop", multiHop); put("protocol", protocol)
+        put("favorites", JSONArray(favorites)); put("recents", JSONArray(recents))
+        put("theme", theme); put("reducedMotion", reducedMotion); put("blur", blur); put("haptics", haptics)
+        put("onboarded", onboarded)
     }
 
     companion object {
@@ -112,21 +145,49 @@ data class Prefs(
         const val SOURCE_FREE = "free"       // free public servers
         const val SOURCE_PROXIO = "proxio"   // Proxio.io (your API key)
         const val SOURCE_BOTH = "both"       // Proxio.io + free
-        const val SOURCE_OWN = "own"         // your own servers (VLESS, VMess, Trojan, SS, SOCKS, HTTP)
+        const val SOURCE_OWN = "own"         // your own servers (VLESS, VMess, Trojan, SS, WireGuard, SOCKS, HTTP)
         const val SOURCE_CUSTOM = "custom"   // proxy integration: pasted curl / Python / Node.js code
         const val SOURCE_LIST = "list"       // proxy list file (host:port:user:pass lines)
+        const val SPLIT_ALL = "all"
+        const val SPLIT_EXCLUDE = "exclude"
+        const val SPLIT_INCLUDE = "include"
+        const val PROTO_AUTO = "auto"
+        const val THEME_SYSTEM = "system"
+        const val THEME_LIGHT = "light"
+        const val THEME_DARK = "dark"
+        const val THEME_PURPLE = "purple"
+
+        /** Protocols the app can use, for the protocol setting. */
+        val PROTOCOLS = listOf(
+            PROTO_AUTO to "Automatic", "wireguard" to "WireGuard", "vless" to "VLESS", "vmess" to "VMess",
+            "trojan" to "Trojan", "shadowsocks" to "Shadowsocks", "socks5" to "SOCKS5", "http" to "HTTP",
+        )
+
         fun fromJson(o: JSONObject?): Prefs {
             if (o == null) return Prefs()
-            val sites = o.optJSONArray("sites")?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList()
+            fun list(k: String) = o.optJSONArray(k)?.let { a -> List(a.length()) { a.getString(it) } } ?: emptyList()
+            val dns = o.optJSONObject("dnsConfig")?.let { DnsConfig.fromJson(it) }
+                ?: DnsConfig.migrate(o.optString("dns", "auto"), o.optString("customDns"))
+            val profiles = o.optJSONArray("dnsProfiles")?.let { a -> (0 until a.length()).mapNotNull { runCatching { DnsProfile.fromJson(a.getJSONObject(it)) }.getOrNull() } } ?: emptyList()
             return Prefs(
                 enabled = o.optBoolean("enabled"), mode = o.optString("mode", MODE_FULL),
-                selected = o.optString("selected", "auto"), sites = sites,
+                selected = o.optString("selected", "auto"), sites = list("sites"),
                 autoPool = o.optInt("autoPool", 5), country = o.optString("country"),
                 source = o.optString("source", SOURCE_FREE),
                 autoSwitch = o.optBoolean("autoSwitch", true),
                 showSpeed = o.optBoolean("showSpeed", true),
                 speedInNotification = o.optBoolean("speedInNotification", true),
-                dns = o.optString("dns", DnsChoice.AUTO), customDns = o.optString("customDns"),
+                dns = dns, dnsProfiles = profiles,
+                dnsProfile = o.optString("dnsProfile"), dnsDefaultProfile = o.optString("dnsDefaultProfile"),
+                killSwitch = o.optBoolean("killSwitch", true), ipv6Block = o.optBoolean("ipv6Block", true),
+                splitMode = o.optString("splitMode", SPLIT_ALL), splitApps = list("splitApps"),
+                autoConnectBoot = o.optBoolean("autoConnectBoot"), autoConnectLaunch = o.optBoolean("autoConnectLaunch"),
+                autoConnectWifi = o.optBoolean("autoConnectWifi"), autoConnectMobile = o.optBoolean("autoConnectMobile"),
+                multiHop = o.optBoolean("multiHop"), protocol = o.optString("protocol", PROTO_AUTO),
+                favorites = list("favorites"), recents = list("recents"),
+                theme = o.optString("theme", THEME_PURPLE), reducedMotion = o.optBoolean("reducedMotion"),
+                blur = o.optBoolean("blur", true), haptics = o.optBoolean("haptics", true),
+                onboarded = o.optBoolean("onboarded"),
             )
         }
     }
@@ -151,12 +212,16 @@ data class Source(
 }
 
 data class Status(
-    val state: String = "off",          // off, connecting, on
+    val state: String = "off",          // off, connecting, on, reconnecting, failed
     val label: String = "",
     val serverIds: List<String> = emptyList(),
     val error: String = "",
     val warning: String = "",
     val since: Long = 0,
+    val ping: Int? = null,              // latest measured delay through the server in use
+    val protocol: String = "",          // protocol of the server in use
+    val hops: String = "",              // multi-hop route, e.g. "🇩🇪 → 🇺🇸"
+    val blocking: Boolean = false,      // kill switch: VPN held up with all traffic blocked
 )
 
 data class FreeStatus(
@@ -224,14 +289,35 @@ data class AppState(
     val ownTesting: Boolean = false,    // your own servers are being tested
     val traffic: Traffic = Traffic(),
     val speedTest: SpeedTest = SpeedTest(),
+    val history: History = History(),
+    val dnsStats: DnsStats = DnsStats(),
+    val dnsTest: TestRun = TestRun(),
+    val diagnostics: TestRun = TestRun(),
+    val ipInfo: IpInfo? = null,
+    val lists: Map<String, BlockLists.Info> = emptyMap(),
+    val listsUpdating: Set<String> = emptySet(),
+    val systemKillSwitch: Pair<Boolean, Boolean>? = null,   // (always-on VPN, block connections without VPN), Android 10+
 ) {
     val servers: List<Server> get() = (list + custom + proxio + free + own).distinctBy { it.id }
-    val on: Boolean get() = prefs.enabled && status.state == "on"
+    val on: Boolean get() = prefs.enabled && (status.state == "on" || status.state == "reconnecting")
     val connecting: Boolean get() = status.state == "connecting"
+    val reconnecting: Boolean get() = status.state == "reconnecting"
+    val failed: Boolean get() = status.state == "failed"
+    /** The VPN interface is up (connected, reconnecting, or holding traffic blocked after a failure). */
+    val tunnelUp: Boolean get() = on || (failed && status.blocking)
 }
 
 /** Live VPN traffic: bytes per second and totals since connecting. */
 data class Traffic(val down: Long = 0, val up: Long = 0, val totalDown: Long = 0, val totalUp: Long = 0)
+
+/** Last 60 seconds of speed (bytes/s) and delay samples, for the network monitor charts. */
+data class History(val down: List<Long> = emptyList(), val up: List<Long> = emptyList(), val ping: List<Int> = emptyList())
+
+/** A list of checks (DNS test, network diagnostics). */
+data class TestRun(val running: Boolean = false, val at: Long = 0, val items: List<DnsManager.TestItem> = emptyList())
+
+/** Public address as seen by websites (from ipwho.is, through the VPN when connected). */
+data class IpInfo(val ip: String, val city: String, val region: String, val country: String, val code: String, val isp: String, val viaVpn: Boolean, val at: Long)
 
 /** Result of the speed test in Settings. */
 data class SpeedTest(

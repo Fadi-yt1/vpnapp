@@ -10,47 +10,49 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.ui.res.painterResource
-import com.tervyn.vpn.R
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.Image
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tervyn.vpn.core.AppState
 import com.tervyn.vpn.core.Core
 import com.tervyn.vpn.core.normalizeSite
 import com.tervyn.vpn.vpn.TervynVpnService
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
 
 class MainActivity : ComponentActivity() {
 
@@ -59,18 +61,41 @@ class MainActivity : ComponentActivity() {
         else Toast.makeText(this, "Tervyn needs VPN permission to protect your connection.", Toast.LENGTH_LONG).show()
     }
 
+    /** Onboarding: ask for VPN permission without connecting yet. */
+    private val vpnPermissionOnly = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { }
+
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         startVpn()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(
-            statusBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT),
-            navigationBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT),
+            statusBarStyle = SystemBarStyle.auto(AColor.TRANSPARENT, AColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.auto(AColor.TRANSPARENT, AColor.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
-        setContent { TervynTheme { App(onPower = ::onPower) } }
+        val first = Core.state.value
+        C.palette = Palettes.forTheme(first.prefs.theme, resources.configuration.isNightModeActiveCompat())
+        setContent {
+            val st by Core.state.collectAsStateWithLifecycle()
+            val haze = remember { HazeState() }
+            val p = st.prefs
+            TervynTheme(p.theme, isSystemInDarkTheme(), p.reducedMotion, GlassEnv(haze, p.blur, p.reducedMotion, p.haptics)) {
+                val dark = C.isDark
+                SideEffect {
+                    WindowCompat.getInsetsController(window, window.decorView).apply {
+                        isAppearanceLightStatusBars = !dark
+                        isAppearanceLightNavigationBars = !dark
+                    }
+                }
+                App(st, onPower = ::onPower, askVpnPermission = ::askVpnPermission)
+            }
+        }
         handleShare(intent)
+        // Auto-connect when the app opens (Security → Auto connect).
+        if (savedInstanceState == null && first.prefs.autoConnectLaunch && first.prefs.onboarded && !first.on && !first.connecting &&
+            VpnService.prepare(this) == null
+        ) TervynVpnService.connect(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -98,9 +123,13 @@ class MainActivity : ComponentActivity() {
         intent.action = null
     }
 
+    private fun askVpnPermission() {
+        VpnService.prepare(this)?.let { vpnPermissionOnly.launch(it) }
+    }
+
     private fun onPower() {
         val st = Core.state.value
-        if (st.on || st.connecting) {
+        if (st.on || st.connecting || st.failed) {
             TervynVpnService.disconnect()
             return
         }
@@ -122,87 +151,120 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private data class Tab(val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector)
+private fun android.content.res.Configuration.isNightModeActiveCompat(): Boolean =
+    (uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES
 
-private val TABS = listOf(Tab("Home", TIcons.home), Tab("Servers", TIcons.servers), Tab("Sites", TIcons.globe), Tab("Settings", TIcons.gear))
+/** Moving between screens. Sub-pages stack on top of the four tabs. */
+class Nav(
+    val open: (String) -> Unit,
+    val back: () -> Unit,
+    val tab: (Int) -> Unit,
+)
+
+object Routes {
+    const val DNS = "dns"
+    const val MONITOR = "monitor"
+    const val SPLIT = "split"
+    const val APPEARANCE = "appearance"
+    const val SOURCES = "sources"
+    const val SITES = "sites"
+    const val DIAGNOSTICS = "diagnostics"
+    const val CONNECTION = "connection"
+    const val AUTOCONNECT = "autoconnect"
+    const val ABOUT = "about"
+    const val HELP = "help"
+    const val PRIVACY = "privacy"
+}
+
+private val TABS = listOf(
+    NavItem("Home", TIcons.home), NavItem("Locations", TIcons.globe),
+    NavItem("Security", TIcons.shield), NavItem("Settings", TIcons.gear),
+)
 
 @Composable
-fun App(onPower: () -> Unit) {
-    val st by Core.state.collectAsStateWithLifecycle()
+fun App(st: AppState, onPower: () -> Unit, askVpnPermission: () -> Unit) {
+    val env = LocalGlass.current
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    var stackStr by rememberSaveable { mutableStateOf("") }
+    val stack = stackStr.split('/').filter { it.isNotEmpty() }
+    val nav = Nav(
+        open = { r -> stackStr = (stackStr.split('/').filter { it.isNotEmpty() } + r).joinToString("/") },
+        back = { stackStr = stackStr.split('/').filter { it.isNotEmpty() }.dropLast(1).joinToString("/") },
+        tab = { t -> tab = t; stackStr = "" },
+    )
+    BackHandler(enabled = stack.isNotEmpty()) { nav.back() }
+    BackHandler(enabled = stack.isEmpty() && tab != 0) { tab = 0 }
+
     Box(Modifier.fillMaxSize()) {
-        GlassBackground(on = st.on)
-        Column(Modifier.fillMaxSize()) {
-            Header(st)
-            Box(Modifier.weight(1f).fillMaxWidth().imePadding()) {
-                when (tab) {
-                    0 -> HomeScreen(st, onPower) { tab = it }
-                    1 -> ServersScreen(st) { tab = 0 }
-                    2 -> SitesScreen(st)
-                    else -> SettingsScreen(st)
+        GlassBackground(on = st.on, modifier = if (env.haze != null) Modifier.hazeSource(env.haze) else Modifier)
+        if (!st.prefs.onboarded) {
+            OnboardingScreen(st, askVpnPermission) { Core.setOnboarded() }
+        } else {
+        val route = stack.lastOrNull() ?: "tab$tab"
+        AnimatedContent(
+            targetState = route,
+            transitionSpec = {
+                val forward = !targetState.startsWith("tab") &&
+                    (initialState.startsWith("tab") || stack.indexOf(targetState) > stack.indexOf(initialState))
+                when {
+                    env.reducedMotion -> fadeIn(tween(0)) togetherWith fadeOut(tween(0))
+                    targetState.startsWith("tab") && initialState.startsWith("tab") -> fadeIn(tween(220)) togetherWith fadeOut(tween(160))
+                    forward -> (slideInHorizontally(tween(280)) { it / 4 } + fadeIn(tween(220))) togetherWith fadeOut(tween(160))
+                    else -> (slideInHorizontally(tween(280)) { -it / 4 } + fadeIn(tween(220))) togetherWith fadeOut(tween(160))
                 }
+            },
+            label = "page",
+            modifier = Modifier.fillMaxSize().imePadding(),
+        ) { r ->
+            when (r) {
+                "tab0" -> HomeScreen(st, nav, onPower)
+                "tab1" -> LocationsScreen(st, nav)
+                "tab2" -> SecurityScreen(st, nav)
+                "tab3" -> SettingsScreen(st, nav)
+                Routes.DNS -> DnsScreen(st, nav)
+                Routes.MONITOR -> MonitorScreen(st, nav)
+                Routes.SPLIT -> SplitTunnelScreen(st, nav)
+                Routes.APPEARANCE -> AppearanceScreen(st, nav)
+                Routes.SOURCES -> SourcesScreen(st, nav)
+                Routes.SITES -> SitesScreen(st, nav)
+                Routes.DIAGNOSTICS -> DiagnosticsScreen(st, nav)
+                Routes.CONNECTION -> ConnectionScreen(st, nav)
+                Routes.AUTOCONNECT -> AutoConnectScreen(st, nav)
+                Routes.ABOUT, Routes.HELP, Routes.PRIVACY -> InfoScreen(r, nav)
+                else -> HomeScreen(st, nav, onPower)
             }
-            GlassNavBar(tab) { tab = it }
+        }
+        if (stack.isEmpty()) {
+            GlassNavigationBar(TABS, tab, { tab = it }, Modifier.align(Alignment.BottomCenter))
+        }
         }
     }
 }
 
+/**
+ * Standard scrolling page. [sub]: a page opened on top of a tab (back button,
+ * no tab bar); otherwise leaves room for the floating tab bar.
+ */
 @Composable
-private fun Header(st: AppState) {
-    Row(
-        Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 18.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+fun Page(
+    title: String?,
+    nav: Nav?,
+    sub: Boolean,
+    subtitle: String? = null,
+    trailing: (@Composable () -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            .statusBarsPadding().padding(horizontal = 18.dp).padding(top = 6.dp)
+            .then(if (sub) Modifier.navigationBarsPadding() else Modifier),
+        verticalArrangement = Arrangement.Top,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Image(
-                painterResource(R.drawable.logo_full), "Tervyn",
-                modifier = Modifier.size(38.dp).clip(RoundedCornerShape(11.dp)).border(1.dp, C.glassBorder, RoundedCornerShape(11.dp)),
-            )
-            HSpace(10)
-            Text("Tervyn", color = C.text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            HSpace(4)
-            Text("VPN", color = C.cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
-                modifier = Modifier.padding(top = 5.dp))
-        }
-        val (label, color) = when {
-            st.connecting -> "CONNECTING" to C.amber
-            st.on -> "PROTECTED" to C.green
-            else -> "OFF" to C.muted
-        }
-        Row(
-            Modifier.glass(RoundedCornerShape(99.dp)).padding(horizontal = 12.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-            HSpace(7)
-            Text(label, color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
-        }
+        if (title != null) PageHeader(title, if (sub && nav != null) nav.back else null, subtitle, trailing)
+        content()
+        if (sub) VSpace(24) else BottomBarSpace()
     }
 }
 
-/** Floating frosted tab bar. */
 @Composable
-private fun GlassNavBar(tab: Int, onSelect: (Int) -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp)
-            .glass(RoundedCornerShape(28.dp)).padding(6.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        TABS.forEachIndexed { i, t ->
-            val active = tab == i
-            Column(
-                Modifier.weight(1f).clip(RoundedCornerShape(22.dp))
-                    .then(if (active) Modifier.background(C.glassFillSelected).border(1.dp, C.glassBorderSelected, RoundedCornerShape(22.dp)) else Modifier)
-                    .clickable { onSelect(i) }
-                    .padding(vertical = 8.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Icon(t.icon, t.label, tint = if (active) Color.White else C.muted, modifier = Modifier.size(22.dp))
-                VSpace(3)
-                Text(t.label, color = if (active) Color.White else C.muted, fontSize = 11.sp,
-                    fontWeight = if (active) FontWeight.Bold else FontWeight.Medium)
-            }
-        }
-    }
-}
+fun FullWidth(content: @Composable ColumnScope.() -> Unit) = Column(Modifier.fillMaxWidth(), content = content)

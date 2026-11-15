@@ -63,9 +63,27 @@ object XrayConfig {
                     "address" to s.address, "port" to s.port, "method" to s.method, "password" to s.password,
                 ))),
             )
+            "wireguard" -> obj(
+                "protocol" to "wireguard",
+                "settings" to clean(obj(
+                    "secretKey" to s.wgSecretKey,
+                    "address" to JSONArray(s.wgAddress.ifEmpty { listOf("10.0.0.2/32") }),
+                    "peers" to JSONArray().put(clean(obj(
+                        "publicKey" to s.wgPublicKey,
+                        "preSharedKey" to s.wgPresharedKey,
+                        "endpoint" to "${if (s.address.contains(':')) "[${s.address}]" else s.address}:${s.port}",
+                        "keepAlive" to s.wgKeepAlive.takeIf { it > 0 },
+                        "allowedIPs" to JSONArray(listOf("0.0.0.0/0", "::/0")),
+                    ))),
+                    "mtu" to (s.wgMtu.takeIf { it > 0 } ?: 1420),
+                    "reserved" to if (s.wgReserved.size == 3) JSONArray(s.wgReserved) else null,
+                    // Userspace WireGuard: Android apps can't create kernel tunnels.
+                    "noKernelTun" to true,
+                )),
+            )
             else -> throw IllegalArgumentException("Unsupported protocol ${s.proto}")
         }
-        val stream = if (s.proto == "shadowsocks") JSONObject() else streamSettings(s)
+        val stream = if (s.proto == "shadowsocks" || s.proto == "wireguard") JSONObject() else streamSettings(s)
         // Resolve the server's name with Xray's own DNS (IPv4).
         stream.put("sockopt", obj("domainStrategy" to "UseIPv4"))
         ob.put("streamSettings", stream)

@@ -46,6 +46,35 @@ object ProxyDialer {
         }
     }
 
+    /**
+     * Multi-hop: connects through [hops] in order (entry first, exit last), so
+     * the website only sees the exit server and the exit server only sees the entry.
+     */
+    fun openChain(hops: List<ProxyEndpoint>, host: String, port: Int, timeoutMs: Int = 10_000): Socket {
+        if (hops.size == 1) return open(hops[0], host, port, timeoutMs)
+        // Through the entry server to the exit server, then ask the exit server for the site.
+        val s = open(hops[0], hops[1].address, hops[1].port, timeoutMs)
+        try {
+            for (i in 1 until hops.size) {
+                val next = hops.getOrNull(i + 1)
+                s.soTimeout = timeoutMs
+                val p = hops[i]
+                try {
+                    if (p.proto == "socks5") socks5(s, p, next?.address ?: host, next?.port ?: port)
+                    else httpConnect(s, p, next?.address ?: host, next?.port ?: port)
+                } catch (e: IOException) {
+                    if (e is ProxyDeadException || e is TargetFailedException) throw e
+                    throw ProxyDeadException("Server ${p.address}:${p.port} failed: ${e.message}", e)
+                }
+            }
+            s.soTimeout = 0
+            return s
+        } catch (e: Throwable) {
+            runCatching { s.close() }
+            throw e
+        }
+    }
+
     private fun socks5(s: Socket, p: ProxyEndpoint, host: String, port: Int) {
         val out = s.getOutputStream()
         val inp = s.getInputStream()

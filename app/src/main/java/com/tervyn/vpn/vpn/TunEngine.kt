@@ -18,12 +18,11 @@ interface Router {
     fun connectProxied(host: String, port: Int): Socket
     /** Normal connection (not through the VPN). */
     fun connectDirect(host: String, port: Int): Socket
-    /** Looks up a raw DNS query the engine doesn't answer itself (other sites, other record types). */
-    fun forwardDns(query: ByteArray): ByteArray?
-    /** True when a DNS provider was chosen, so names are checked with it before going through the VPN. */
-    val checksNames: Boolean
-    /** The provider's reply if it blocks this name (ad / malware filter), else null. */
-    fun blockedReply(query: ByteArray, name: String): ByteArray?
+    /**
+     * Answers an app's DNS query (filtering, your resolver, stand-in addresses).
+     * [proxied]: the name goes through the VPN. null drops the query.
+     */
+    fun handleDns(query: ByteArray, q: Dns.Question, proxied: Boolean, fake: (String) -> Int): ByteArray?
 }
 
 /**
@@ -136,15 +135,12 @@ class TunEngine(
         val q = Dns.parse(payload) ?: return
         val reply = { data: ByteArray -> write(Ip.udp(dst, src, dport, sport, data)) }
         val proxied = q.name.isNotEmpty() && router.shouldProxy(q.name)
-        when {
-            proxied && q.type == Dns.A -> {
-                if (!router.checksNames) reply(Dns.reply(payload, q, fakeDns.ipFor(q.name)))
-                // A DNS provider was chosen: let it block ads / malware first.
-                else pool.execute { reply(router.blockedReply(payload, q.name) ?: Dns.reply(payload, q, fakeDns.ipFor(q.name))) }
+        pool.execute {
+            try {
+                router.handleDns(payload, q, proxied) { fakeDns.ipFor(it) }?.let(reply)
+            } catch (e: Exception) {
+                log("dns error: $e")
             }
-            // No IPv6 / HTTPS records for VPN sites, so apps use the stand-in IPv4 address.
-            proxied && (q.type == Dns.AAAA || q.type == Dns.HTTPS) -> reply(Dns.reply(payload, q, null))
-            else -> pool.execute { router.forwardDns(payload)?.let(reply) }
         }
     }
 

@@ -48,7 +48,7 @@ private val SLIDES = listOf(
     Slide("Smart Connect", "Servers are tested for ping and speed, and Tervyn moves you to the fastest one automatically.", TIcons.sparkle),
     Slide("Private DNS & blocking", "Encrypted lookups that stay inside the tunnel, plus blocking for ads, trackers, malware and phishing.", TIcons.dns),
     Slide("Make it yours", "Pick a glass style. You can change it any time in Settings → Appearance.", TIcons.palette),
-    Slide("Allow the VPN", "Android will ask you to allow Tervyn to set up a VPN connection. This is what lets it route your traffic securely.", TIcons.shield),
+    Slide("A few permissions", "Allow the VPN (required), notifications for the connection status, and background running so Android doesn't cut the VPN.", TIcons.shield),
 )
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -108,9 +108,9 @@ fun OnboardingScreen(st: AppState, askVpnPermission: () -> Unit, onDone: () -> U
             }
         }
         if (last) {
-            GlassButton("Allow VPN", Modifier.fillMaxWidth(), icon = TIcons.shield) { askVpnPermission() }
-            VSpace(10)
-            GlassButton("Start using Tervyn", Modifier.fillMaxWidth(), ButtonStyle.Secondary) { onDone() }
+            PermissionRows(LocalPerms.current)
+            VSpace(12)
+            GlassButton("Start using Tervyn", Modifier.fillMaxWidth(), if (LocalPerms.current.vpn) ButtonStyle.Primary else ButtonStyle.Secondary) { onDone() }
         } else {
             GlassButton("Continue", Modifier.fillMaxWidth()) { scope.launch { pager.animateScrollToPage(pager.currentPage + 1) } }
         }

@@ -100,6 +100,38 @@ class DnsManager(
         return resolve(query, q, upstreams(cfg, false), false)
     }
 
+    /**
+     * OpenVPN mode (all traffic goes through the tunnel as packets): filter, then either
+     * forward the query through the tunnel (plain resolvers: Automatic uses the server's DNS)
+     * or resolve it here with your encrypted resolver.
+     */
+    fun handlePacket(query: ByteArray, q: Dns.Question, cfg: DnsConfig, pushedDns: List<String>): com.tervyn.vpn.vpn.DnsAction {
+        synchronized(lock) { stats = stats.copy(queries = stats.queries + 1) }
+        val cat = lists.match(q.name, cfg.filters, cfg.blockList, cfg.allowList)
+        if (cat != null) {
+            synchronized(lock) {
+                val by = stats.blockedByCategory.toMutableMap()
+                by[cat] = (by[cat] ?: 0) + 1
+                stats = stats.copy(blocked = stats.blocked + 1, blockedByCategory = by)
+            }
+            return com.tervyn.vpn.vpn.DnsAction.Answer(Dns.blocked(query, q))
+        }
+        // The tunnel carries IPv4 only: no IPv6 answers, so apps don't try (and fail) over IPv6.
+        if (q.type == Dns.AAAA) return com.tervyn.vpn.vpn.DnsAction.Answer(Dns.reply(query, q, null))
+        val plain: String? = when (cfg.mode) {
+            DnsConfig.AUTO -> pushedDns.firstOrNull { DnsConfig.isIpv4(it) } ?: "1.1.1.1"
+            DnsConfig.CUSTOM -> listOf(cfg.primary, cfg.secondary).firstOrNull { DnsConfig.isIpv4(it) }
+            DnsConfig.PRESET -> if (cfg.leakProtection) cfg.presetInfo?.ip1 else null
+            else -> null
+        }
+        if (plain != null) {
+            synchronized(lock) { stats = stats.copy(viaTunnel = stats.viaTunnel + 1, lastResolver = "$plain · through VPN", lastError = "") }
+            return com.tervyn.vpn.vpn.DnsAction.Forward(Ip.parse(plain))
+        }
+        val ans = resolve(query, q, upstreams(cfg, false), false) ?: return com.tervyn.vpn.vpn.DnsAction.Answer(Dns.servfail(query, q))
+        return com.tervyn.vpn.vpn.DnsAction.Answer(ans)
+    }
+
     private fun resolve(query: ByteArray, q: Dns.Question, ups: List<Upstream>, viaTunnel: Boolean): ByteArray? {
         val key = "${q.name}|${q.type}"
         val now = System.currentTimeMillis()

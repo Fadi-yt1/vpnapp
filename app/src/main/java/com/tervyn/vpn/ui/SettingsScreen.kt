@@ -70,7 +70,9 @@ fun SettingsScreen(st: AppState, nav: Nav) {
 
         SectionLabel("DNS")
         GroupCard {
-            SettingRow(TIcons.dns, "DNS Center", p.dns.label, onClick = { nav.open(Routes.DNS) })
+            SettingRow(TIcons.dns, "Tervyn DNS", if (p.dnsEnabled) "On · ${p.dns.label}" else "Off: the VPN server's DNS", checked = p.dnsEnabled, onCheckedChange = Core::setDnsEnabled)
+            RowDivider()
+            SettingRow(TIcons.filter, "DNS Center", "Resolver, blocking, profiles, test", onClick = { nav.open(Routes.DNS) })
         }
 
         SectionLabel("Security")
@@ -99,6 +101,12 @@ fun SettingsScreen(st: AppState, nav: Nav) {
                 onClick = { runCatching { ctx.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) } })
             RowDivider()
             SettingRow(TIcons.apps, "Quick Settings tile", "Swipe down twice → edit → drag \"Tervyn VPN\" into your tiles")
+        }
+
+        SectionLabel("Permissions")
+        GroupCard {
+            val pm = LocalPerms.current
+            SettingRow(TIcons.shield, "App permissions", if (pm.missing == 0) "All set" else "${pm.missing} missing", onClick = { nav.open(Routes.PERMISSIONS) })
         }
 
         SectionLabel("Support")

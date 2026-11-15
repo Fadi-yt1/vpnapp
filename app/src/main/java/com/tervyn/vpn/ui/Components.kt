@@ -905,6 +905,7 @@ fun ServerRow(
 fun protoName(proto: String): String = when (proto) {
     "shadowsocks" -> "Shadowsocks"
     "wireguard" -> "WireGuard"
+    "openvpn" -> "OpenVPN"
     "socks5" -> "SOCKS5"
     "vless" -> "VLESS"
     "vmess" -> "VMess"
@@ -916,6 +917,8 @@ fun protoName(proto: String): String = when (proto) {
 
 fun serverSub(s: Server): String {
     val kind = when {
+        s.sourceId == com.tervyn.vpn.core.VpnGate.SOURCE -> "VPN Gate"
+        s.sourceId == com.tervyn.vpn.core.Warp.SOURCE -> "Cloudflare WARP"
         s.free -> "Free"
         s.isProxio -> "Proxio.io"
         s.sourceId == ProxySnippet.SOURCE -> "Integration"

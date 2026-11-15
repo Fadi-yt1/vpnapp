@@ -41,7 +41,8 @@ import java.text.DateFormat
 import java.util.Date
 
 private val SOURCE_OPTIONS = listOf(
-    Triple(Prefs.SOURCE_FREE, "Free public servers", "Found and tested automatically"),
+    Triple(Prefs.SOURCE_VPNGATE, "VPN Gate + Cloudflare WARP", "Free OpenVPN servers by volunteers, plus free WireGuard. Recommended"),
+    Triple(Prefs.SOURCE_FREE, "Free public proxies", "Found and tested automatically"),
     Triple(Prefs.SOURCE_PROXIO, "Proxio.io", "Servers from your Proxio.io API key"),
     Triple(Prefs.SOURCE_BOTH, "Proxio.io + free", "Both, fastest first"),
     Triple(Prefs.SOURCE_OWN, "Your own servers", "WireGuard, VLESS, VMess, Trojan, Shadowsocks, SOCKS5, HTTP"),
@@ -100,6 +101,10 @@ fun SourcesScreen(st: AppState, nav: Nav) {
         VSpace(6)
         Muted(sourceStatus(st), Modifier.padding(horizontal = 6.dp))
 
+        SectionLabel("VPN Gate")
+        VpnGateCard(st)
+        SectionLabel("Cloudflare WARP (WireGuard)")
+        WarpCard(st)
         SectionLabel("Your own servers")
         OwnServersCard(st)
         SectionLabel("Proxio.io")
@@ -136,6 +141,63 @@ private fun ProxyRow(s: Server) {
 }
 
 @Composable
+private fun VpnGateCard(st: AppState) {
+    val vg = st.vpngateStatus
+    val working = st.vpngate.count { it.ms != null }
+    GlassCard {
+        Muted("Free OpenVPN servers run by volunteers for the VPN Gate project (University of Tsukuba). Tervyn downloads the official list and measures each server's response time from your phone. They protect all apps.")
+        VSpace(12)
+        GlassButton(if (vg.busy) "Testing…" else "Refresh VPN Gate servers", Modifier.fillMaxWidth(), icon = TIcons.refresh,
+            loading = vg.busy, enabled = !vg.busy) { Core.refreshVpnGateAsync() }
+        if (vg.busy) { VSpace(10); GlassProgressBar(null) }
+        StatusLine(
+            when {
+                vg.state == "loading" -> "Downloading the list…"
+                vg.state == "testing" -> "Testing ${vg.fetched} servers…"
+                vg.error.isNotEmpty() -> vg.error
+                vg.at > 0 -> "$working of ${vg.fetched} servers answering · updated " + DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(vg.at))
+                else -> ""
+            },
+            if (vg.error.isNotEmpty()) C.red else if (working > 0) C.green else C.muted,
+        )
+        if (working > 0) {
+            VSpace(6)
+            for (s in st.vpngate.filter { it.ms != null }.take(5)) ProxyRow(s)
+        }
+    }
+}
+
+@Composable
+private fun WarpCard(st: AppState) {
+    val w = rememberWorker()
+    val warp = st.own.firstOrNull { it.sourceId == com.tervyn.vpn.core.Warp.SOURCE }
+    GlassCard {
+        Muted("Cloudflare's free WireGuard network: fast, encrypted, everywhere. Tervyn makes a WireGuard key on your phone and signs it up with Cloudflare (like the 1.1.1.1 app). Your traffic exits from a Cloudflare server near you, so it encrypts and speeds up your connection but doesn't change your country.")
+        VSpace(12)
+        if (warp == null) {
+            GlassButton(if (w.running) "Setting up…" else "Add Cloudflare WARP", Modifier.fillMaxWidth(), icon = TIcons.bolt,
+                loading = w.running, enabled = !w.running) { w.run { Core.addWarp() } }
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBubble(TIcons.bolt, if (warp.ms != null) C.green else C.amber, 32.dp)
+                HSpace(10)
+                Column(Modifier.weight(1f)) {
+                    Text("Cloudflare WARP", color = C.text, fontWeight = FontWeight.SemiBold)
+                    Muted("WireGuard · ${warp.hostPort}")
+                }
+                PingBadge(warp.ms, warp.testedAt > 0)
+            }
+            VSpace(10)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GlassButton("Use only WARP", Modifier.weight(1f), ButtonStyle.Secondary) { Core.select(warp.id) }
+                GlassButton("Remove", Modifier.weight(1f), ButtonStyle.Danger) { Core.removeWarp(); w.msg = "Removed." }
+            }
+        }
+        StatusLine(w.msg, if (w.msg.contains("ready") || w.msg == "Removed.") C.green else C.amber)
+    }
+}
+
+@Composable
 private fun OwnServersCard(st: AppState) {
     val ctx = LocalContext.current
     var url by rememberSaveable { mutableStateOf("") }
@@ -158,7 +220,7 @@ private fun OwnServersCard(st: AppState) {
     }
 
     GlassCard {
-        Muted("Paste share links, a subscription link or a WireGuard config (.conf). Imported servers are tested and the fastest is used when the source is \"Your own servers\".")
+        Muted("Paste share links, a subscription link, a WireGuard config (.conf) or an OpenVPN config (.ovpn). Imported servers are tested and the fastest is used when the source is \"Your own servers\".")
         VSpace(12)
         GlassInput(paste, { paste = it }, "wireguard://…  vless://…  vmess://…  trojan://…  ss://…  socks5://…\nor a [Interface] / [Peer] config",
             singleLine = false, minLines = 3)
@@ -166,7 +228,7 @@ private fun OwnServersCard(st: AppState) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             GlassButton("Import", Modifier.weight(1f), enabled = paste.isNotBlank()) { val t = paste; run({ Core.importPasted(t) }) { paste = "" } }
             GlassButton("Open file…", Modifier.weight(1f), ButtonStyle.Secondary, icon = TIcons.upload) {
-                picker.launch(arrayOf("text/*", "application/octet-stream", "application/x-wireguard-profile"))
+                picker.launch(arrayOf("text/*", "application/octet-stream", "application/x-wireguard-profile", "application/x-openvpn-profile"))
             }
         }
         VSpace(14)

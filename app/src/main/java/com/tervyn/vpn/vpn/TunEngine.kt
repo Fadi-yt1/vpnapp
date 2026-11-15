@@ -36,7 +36,7 @@ class TunEngine(
     val router: Router,
     private val fakeDns: FakeDns,
     private val log: (String) -> Unit = {},
-) {
+) : TunnelEngine {
     data class Key(val src: Int, val sport: Int, val dst: Int, val dport: Int)
 
     private val conns = ConcurrentHashMap<Key, TcpConn>()
@@ -52,16 +52,16 @@ class TunEngine(
     val connectionCount get() = conns.size
 
     /** Bytes sent to apps (download) and received from apps (upload), for the live speed display. */
-    val bytesDown = java.util.concurrent.atomic.AtomicLong()
-    val bytesUp = java.util.concurrent.atomic.AtomicLong()
+    override val bytesDown = java.util.concurrent.atomic.AtomicLong()
+    override val bytesUp = java.util.concurrent.atomic.AtomicLong()
 
-    fun start() {
+    override fun start() {
         running = true
         Thread({ loop() }, "tervyn-tun").apply { isDaemon = true }.start()
         timer.scheduleWithFixedDelay({ tick() }, 250, 250, TimeUnit.MILLISECONDS)
     }
 
-    fun stop() {
+    override fun stop() {
         running = false
         for (c in conns.values.toList()) c.shutdown()
         conns.clear()

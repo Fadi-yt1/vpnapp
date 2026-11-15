@@ -153,6 +153,7 @@ fun LocationsScreen(st: AppState, nav: Nav) {
         Prefs.SOURCE_OWN -> st.ownTesting
         Prefs.SOURCE_PROXIO -> st.proxioStatus.busy
         Prefs.SOURCE_BOTH -> st.proxioStatus.busy || fs.busy
+        Prefs.SOURCE_VPNGATE -> st.vpngateStatus.busy || st.ownTesting
         else -> fs.busy
     }
     val all = st.servers
@@ -202,7 +203,7 @@ fun LocationsScreen(st: AppState, nav: Nav) {
         }
         if (busy) item {
             Box(Modifier.padding(vertical = 4.dp)) {
-                GlassProgressBar(if (fs.state == "testing") fs.progress / 100f else null)
+                GlassProgressBar(if (prefs.source != Prefs.SOURCE_VPNGATE && fs.state == "testing") fs.progress / 100f else null)
             }
         }
         item { ServerRow(null, prefs.selected == "auto") { Core.select("auto"); nav.tab(0) } }
@@ -258,7 +259,16 @@ fun sourceStatus(st: AppState): String {
         ps.error.isNotEmpty() -> ps.error
         else -> "${st.proxio.count { it.ms != null }} of ${ps.fetched} Proxio.io servers working."
     }
+    val vg = st.vpngateStatus
     return when (st.prefs.source) {
+        Prefs.SOURCE_VPNGATE -> when {
+            vg.state == "loading" -> "Downloading the VPN Gate server list…"
+            vg.state == "testing" -> "Testing ${vg.fetched} VPN Gate servers from your network…"
+            vg.error.isNotEmpty() && st.vpngate.none { it.ms != null } -> vg.error
+            vg.at > 0 -> "${st.vpngate.count { it.ms != null }} of ${vg.fetched} VPN Gate servers answering · ping measured from your phone · updated " +
+                DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(vg.at))
+            else -> "VPN Gate servers are being prepared…"
+        } + (st.own.firstOrNull { it.sourceId == com.tervyn.vpn.core.Warp.SOURCE }?.let { w -> "\nCloudflare WARP: " + (w.ms?.let { "$it ms" } ?: "not answering") } ?: "")
         Prefs.SOURCE_LIST -> if (st.list.isEmpty()) "Import your proxy list in Server sources." else "${st.list.count { it.ms != null }} of ${st.list.size} proxies in your list working."
         Prefs.SOURCE_CUSTOM -> if (st.custom.isEmpty()) "Paste your proxy's code in Server sources." else "${st.custom.count { it.ms != null }} of ${st.custom.size} integration proxies working."
         Prefs.SOURCE_OWN -> if (st.own.isEmpty()) "Add your own servers in Server sources." else "${st.own.count { it.ms != null }} of ${st.own.size} of your servers working."

@@ -49,7 +49,7 @@ class TervynVpnService : VpnService() {
 
     private val tunLock = Any()
     private var tun: ParcelFileDescriptor? = null
-    @Volatile private var engine: TunEngine? = null
+    @Volatile private var engine: TunnelEngine? = null
     private val listener: () -> Unit = { updateNotification() }
 
     override fun onCreate() {
@@ -73,12 +73,18 @@ class TervynVpnService : VpnService() {
     }
 
     /** (Re)builds the VPN interface and starts forwarding packets. Called by Core. */
-    fun startTunnel(fullMode: Boolean, router: Router) {
+    /**
+     * (Re)builds the VPN interface. With [ovpn] (an OpenVPN server), every packet goes
+     * into that tunnel ([dnsAction] answers DNS); otherwise connections are relayed
+     * through proxy servers by [TunEngine].
+     */
+    fun startTunnel(fullMode: Boolean, router: Router, ovpn: com.tervyn.vpn.ovpn.OpenVpnClient? = null, dnsAction: ((ByteArray) -> DnsAction)? = null) {
+        val full = fullMode || ovpn != null
         synchronized(tunLock) {
             val prefs = Core.state.value.prefs
             val b = Builder()
                 .setSession(getString(R.string.app_name))
-                .setMtu(1500)
+                .setMtu(if (ovpn != null) 1400 else 1500)
                 .addAddress(com.tervyn.vpn.vpn.Ip.str(FakeDns.TUN_IP), 32)
                 .addDnsServer(com.tervyn.vpn.vpn.Ip.str(FakeDns.DNS_IP))
                 .setBlocking(true)
@@ -91,7 +97,7 @@ class TervynVpnService : VpnService() {
                 b.addDisallowedApplication(packageName)
                 if (prefs.splitMode == Prefs.SPLIT_EXCLUDE) for (a in apps) runCatching { b.addDisallowedApplication(a) }
             }
-            if (fullMode) {
+            if (full) {
                 b.addRoute("0.0.0.0", 0)
                 if (prefs.ipv6Block) {
                     // Capture IPv6 too, so nothing leaks around the VPN (it's dropped; DNS gives IPv4 only).
@@ -113,10 +119,13 @@ class TervynVpnService : VpnService() {
             val newTun = b.establish() ?: throw IllegalStateException("VPN permission was removed. Open Tervyn and tap connect again.")
             stopEngineLocked()
             tun = newTun
-            engine = TunEngine(
+            engine = (if (ovpn != null) PacketEngine(
+                FileInputStream(newTun.fileDescriptor), FileOutputStream(newTun.fileDescriptor),
+                ovpn, dnsAction ?: { DnsAction.Drop },
+            ) { Log.d(TAG, it) } else TunEngine(
                 FileInputStream(newTun.fileDescriptor), FileOutputStream(newTun.fileDescriptor),
                 router, Core.fakeDns,
-            ) { Log.d(TAG, it) }.also { it.start() }
+            ) { Log.d(TAG, it) }).also { it.start() }
         }
         updateNotification()
     }

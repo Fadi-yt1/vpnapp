@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.util.Log
 import com.tervyn.vpn.net.ProxyDeadException
+import com.tervyn.vpn.ovpn.OpenVpnClient
+import com.tervyn.vpn.ovpn.OpenVpnConfig
 import com.tervyn.vpn.net.ProxyDialer
 import com.tervyn.vpn.net.ProxyEndpoint
 import com.tervyn.vpn.net.ProxyTester
@@ -61,6 +63,11 @@ object Core {
     /** With auto-switch off: the server to stay on (saved, so it survives list refreshes). */
     @Volatile private var pinned: Server? = null
 
+    /** A hand-picked server that was down when connecting (we used the fastest one instead). */
+    @Volatile private var failedPick: Server? = null
+
+    private fun serverName(s: Server) = if (s.country != "Unknown") "${s.flag} ${s.country}".trim() else s.name
+
     /** Multi-hop: the entry server traffic goes through before the server in use. */
     @Volatile private var hopEntry: Server? = null
 
@@ -107,6 +114,7 @@ object Core {
             custom = store.customServers(), customCode = store.customCode(), customStatus = store.customStatus(),
             list = store.listServers(), listName = store.listName(), listStatus = store.listStatus(),
             sources = store.sources(), freeStatus = store.freeStatus(),
+            vpngate = store.vpngateServers(), vpngateStatus = store.vpngateStatus(),
         )
         pinned = store.pinned()
         dns = DnsManager(BlockLists(File(app.filesDir, "blocklists")), { systemDns().mapNotNull { it.hostAddress } })
@@ -171,6 +179,16 @@ object Core {
         store.saveProxioServers(list)
     }
 
+    private fun saveVpngate(list: List<Server>) {
+        update { it.copy(vpngate = list) }
+        store.saveVpngateServers(list)
+    }
+
+    private fun setVpngateStatus(st: ProxioStatus) {
+        update { it.copy(vpngateStatus = st) }
+        store.saveVpngateStatus(st)
+    }
+
     private fun saveOwn(list: List<Server>) {
         update { it.copy(own = list) }
         store.saveOwnServers(list)
@@ -184,6 +202,7 @@ object Core {
         refreshListUrls()
         if (p.usesProxio) runCatching { refreshProxio() }
         if (p.usesFree) refreshFree(force = true)
+        if (p.source == Prefs.SOURCE_VPNGATE) runCatching { refreshVpnGate(force = false) }
         if (p.source == Prefs.SOURCE_OWN) testOwn(_state.value.own)
         if (p.source == Prefs.SOURCE_CUSTOM) runCatching { testCustom() }
         if (p.source == Prefs.SOURCE_LIST) runCatching { testList() }
@@ -200,6 +219,25 @@ object Core {
      * servers are tested through Xray: the running one if it already serves
      * them, otherwise a temporary one.
      */
+    /** OpenVPN servers: time the server's answer to the opening handshake packet. */
+    private fun testOpenVpn(list: List<Server>, threads: Int, onResult: (Server, ProxyTester.Result?) -> Unit) {
+        val pool = Executors.newFixedThreadPool(threads.coerceIn(1, 32))
+        try {
+            val futures = list.map { srv ->
+                pool.submit(Runnable {
+                    val ms = runCatching { OpenVpnClient.probe(OpenVpnConfig.parse(srv.link), 4000, ::protectSocket, ::protectSocket) }.getOrNull()
+                    synchronized(ProxyTester) { onResult(srv, ms?.let { ProxyTester.Result(it, srv.code, srv.address) }) }
+                })
+            }
+            futures.forEach { runCatching { it.get(15, TimeUnit.SECONDS) } }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    private fun protectSocket(s: Socket) { service?.protect(s) }
+    private fun protectSocket(s: java.net.DatagramSocket) { service?.protect(s) }
+
     private fun testServers(
         list: List<Server>,
         threads: Int = 64,
@@ -208,7 +246,9 @@ object Core {
         probe: (ProxyEndpoint) -> ProxyTester.Result? = { ProxyTester.test(it) },
         onResult: (Server, ProxyTester.Result?) -> Unit,
     ) {
-        val direct = list.filter { !it.isCore }
+        val ovpnServers = list.filter { it.isOpenVpn }
+        if (ovpnServers.isNotEmpty()) testOpenVpn(ovpnServers, threads, onResult)
+        val direct = list.filter { !it.isCore && !it.isOpenVpn }
         val core = list.filter { it.isCore }
         if (direct.isNotEmpty()) ProxyTester.testMany(direct, threads, stopAfter, maxTimeMs, probe, onResult)
         if (core.isEmpty()) return
@@ -273,9 +313,61 @@ object Core {
             runCatching { refreshProxio() }
         }
         if (p.usesFree) refreshFree(force = false)
+        if (p.source == Prefs.SOURCE_VPNGATE) runCatching { refreshVpnGate(force = false) }
     }
 
     fun refreshFreeAsync() = bg { refreshFree(force = true) }
+
+    @Volatile private var vpngateRefreshing: Thread? = null
+    private val vpngateLock = Object()
+
+    /**
+     * Downloads the VPN Gate list and tests every server from this phone (the
+     * OpenVPN opening handshake, timed). [force] = even if the list is recent.
+     */
+    fun refreshVpnGate(force: Boolean): ProxioStatus {
+        val st0 = _state.value
+        if (!force && System.currentTimeMillis() - st0.vpngateStatus.at < 45 * 60_000 && st0.vpngate.count { it.ms != null } >= 5) return st0.vpngateStatus
+        synchronized(vpngateLock) {
+            if (vpngateRefreshing != null) {
+                while (vpngateRefreshing != null) vpngateLock.wait(500)
+                return _state.value.vpngateStatus
+            }
+            vpngateRefreshing = Thread.currentThread()
+        }
+        try {
+            setVpngateStatus(_state.value.vpngateStatus.copy(state = "loading", error = ""))
+            val servers = try {
+                VpnGate.toServers(VpnGate.parse(VpnGate.download()))
+            } catch (e: Exception) {
+                val err = e.message ?: e.toString()
+                setVpngateStatus(_state.value.vpngateStatus.copy(state = "idle", error = err))
+                return _state.value.vpngateStatus
+            }
+            if (servers.isEmpty()) {
+                setVpngateStatus(_state.value.vpngateStatus.copy(state = "idle", error = "The VPN Gate list was empty. Try again in a minute."))
+                return _state.value.vpngateStatus
+            }
+            setVpngateStatus(_state.value.vpngateStatus.copy(state = "testing", fetched = servers.size))
+            val results = java.util.concurrent.ConcurrentHashMap<String, Int>()
+            testServers(servers, threads = 32) { srv, r -> if (r != null) results[srv.id] = r.ms }
+            val now = System.currentTimeMillis()
+            val tested = servers.map { it.copy(ms = results[it.id], testedAt = now) }
+                .sortedWith(compareBy<Server> { it.ms == null }.thenBy { it.rank }.thenByDescending { it.score })
+            saveVpngate(tested)
+            val working = tested.count { it.ms != null }
+            setVpngateStatus(ProxioStatus(state = "idle", at = now, fetched = servers.size, working = working,
+                error = if (working == 0) "None of the VPN Gate servers answered from your network. Try again later." else ""))
+            return _state.value.vpngateStatus
+        } finally {
+            synchronized(vpngateLock) {
+                vpngateRefreshing = null
+                vpngateLock.notifyAll()
+            }
+        }
+    }
+
+    fun refreshVpnGateAsync() = bg { refreshVpnGate(force = true) }
 
     val isRefreshing get() = refreshing != null || proxioRefreshing != null
 
@@ -560,6 +652,18 @@ object Core {
         try {
             val inUse = chain
             if (inUse.isEmpty()) return
+            if (inUse.first().isOpenVpn) {
+                val o = ovpn
+                if (o == null || !o.alive) {
+                    val first = inUse.first()
+                    markDead(first)
+                    if (_state.value.prefs.selected == first.id) savePrefs { it.copy(selected = "auto") }
+                    if (pinned?.id == first.id) pin(null)
+                    setStatus { it.copy(state = "reconnecting", warning = "${serverName(first)} stopped answering — moved you to the fastest working server.") }
+                    repick()
+                }
+                return
+            }
             // Xray stopped (e.g. Android killed it): start it again.
             if (inUse.any { it.isCore } && mainXray?.alive != true) {
                 runCatching { activate(inUse) }
@@ -582,13 +686,13 @@ object Core {
             saveCustom(upd(_state.value.custom, dropDead = false))
             saveList(upd(_state.value.list, dropDead = false))
             if (dead.isNotEmpty() && !connecting && refreshing == null) {
-                if (inUse.first().id in dead && _state.value.prefs.autoSwitch) setStatus { it.copy(state = "reconnecting") }
-                if (inUse.first().id in dead) {
-                    setStatus {
-                        it.copy(warning = if (_state.value.prefs.autoSwitch)
-                            "A server stopped answering — switched to the next fastest one."
-                        else "The server you picked isn't answering. Pick another one, or turn on Auto-switch.")
-                    }
+                val first = inUse.first()
+                if (first.id in dead) {
+                    // The server in use stopped answering: always move to the fastest working one,
+                    // also when it was picked by hand (otherwise the connection would just be dead).
+                    if (_state.value.prefs.selected == first.id) savePrefs { it.copy(selected = "auto") }
+                    if (pinned?.id == first.id) pin(null)
+                    setStatus { it.copy(state = "reconnecting", warning = "${serverName(first)} stopped answering — moved you to the fastest working server.") }
                 }
                 repick()
             }
@@ -620,16 +724,41 @@ object Core {
     private fun pickServers(prefs: Prefs): List<Server> {
         val st = _state.value
         if (prefs.selected != "auto") {
-            (st.servers.firstOrNull { it.id == prefs.selected } ?: pinned?.takeIf { it.id == prefs.selected })
-                ?.let { return listOf(it) }
+            val picked = st.servers.firstOrNull { it.id == prefs.selected } ?: pinned?.takeIf { it.id == prefs.selected }
+            if (picked != null) {
+                // Make sure the chosen server still answers before using it.
+                var alive = picked.ms != null && System.currentTimeMillis() - picked.testedAt < 10 * 60_000
+                if (!alive) {
+                    var r: ProxyTester.Result? = null
+                    runCatching { testServers(listOf(picked), threads = 1) { _, res -> r = res } }
+                    alive = r != null
+                }
+                if (alive) return listOf(picked)
+                // It's down: don't leave the user without a connection. Use the fastest working server instead.
+                failedPick = picked
+                savePrefs { it.copy(selected = "auto") }
+                pin(null)
+            }
         }
         fun inCountry(l: List<Server>) = if (prefs.country.isEmpty()) l
             else l.filter { it.code == prefs.country }.ifEmpty { l }
         // Protocol setting: only servers of that protocol (Automatic = any).
-        fun ofProtocol(l: List<Server>) = if (prefs.protocol == Prefs.PROTO_AUTO) l else l.filter { it.proto == prefs.protocol }
+        fun ofProtocol(l: List<Server>) = (if (prefs.protocol == Prefs.PROTO_AUTO) l else l.filter { it.proto == prefs.protocol })
+            .filter { !(prefs.targeted && it.isOpenVpn) }   // OpenVPN carries all apps; "Only my sites" needs proxy servers
         fun best(l: List<Server>) = inCountry(ofProtocol(l).filter { it.ms != null }).sortedBy { it.rank }.take(maxOf(2, prefs.autoPool))
 
         when (prefs.source) {
+            Prefs.SOURCE_VPNGATE -> {
+                fun pool() = _state.value.vpngate + _state.value.own.filter { it.sourceId == Warp.SOURCE }
+                if (prefs.targeted) throw IOException("VPN Gate servers protect all apps. Switch Protect to \"All apps\" on Home, or choose another server source for \"Only my sites\".")
+                var list = best(pool())
+                if (list.isEmpty()) {
+                    runCatching { refreshVpnGate(force = true) }
+                    list = best(pool())
+                }
+                if (list.isEmpty()) throw IOException(_state.value.vpngateStatus.error.ifEmpty { "No VPN Gate server is answering right now. Try again in a minute." })
+                return list
+            }
             Prefs.SOURCE_LIST -> {
                 var list = best(_state.value.list)
                 if (list.isEmpty()) {
@@ -724,7 +853,10 @@ object Core {
      * Makes [servers] the ones in use. Starts (or restarts) Xray when some of
      * them are VLESS / VMess / Trojan / Shadowsocks / WireGuard servers.
      */
-    private fun activate(servers: List<Server>) {
+    private fun activate(all: List<Server>) {
+        if (all.firstOrNull()?.isOpenVpn == true) { activateOpenVpn(all.filter { it.isOpenVpn }); return }
+        val servers = all.filter { !it.isOpenVpn }
+        closeOpenVpn()
         synchronized(xrayLock) {
             val core = servers.filter { it.isCore }
             if (core.isEmpty()) {
@@ -749,6 +881,66 @@ object Core {
             hopEntry = pickHopEntry(usable.first())
             dns.resolver.reset()
         }
+    }
+
+    /** The OpenVPN connection in use (VPN Gate / .ovpn servers), else null. */
+    @Volatile var ovpn: OpenVpnClient? = null
+        private set
+
+    private fun closeOpenVpn() {
+        val o = ovpn ?: return
+        ovpn = null
+        runCatching { o.close() }
+    }
+
+    /** Connects to the first OpenVPN server that works (up to 3 tries). */
+    private fun activateOpenVpn(servers: List<Server>) {
+        var last: Exception? = null
+        for (srv in servers.take(3)) {
+            try {
+                val cfg = OpenVpnConfig.parse(srv.link)
+                val c = OpenVpnClient(cfg, ::protectSocket, ::protectSocket) { Log.d(TAG, it) }
+                c.connect()
+                val old = ovpn
+                ovpn = c
+                old?.let { o -> bg { runCatching { o.close() } } }
+                synchronized(xrayLock) {
+                    // Keep Xray only if something else still needs it (nothing does in OpenVPN mode).
+                    mainXray?.stop()
+                    mainXray = null
+                    chain = listOf(srv)
+                    chainEndpoints = emptyList()
+                    hopEntry = null
+                }
+                dns.clear()
+                return
+            } catch (e: Exception) {
+                last = e
+                Log.w(TAG, "openvpn ${srv.hostPort}", e)
+                markDead(srv)
+            }
+        }
+        throw IOException((last?.message ?: "Couldn't connect to the OpenVPN server.") + if (servers.size > 1) " (tried ${minOf(3, servers.size)} servers)" else "")
+    }
+
+    private fun markDead(srv: Server) {
+        val now = System.currentTimeMillis()
+        fun upd(l: List<Server>) = l.map { if (it.id == srv.id) it.copy(ms = null, testedAt = now) else it }
+        if (srv.sourceId == VpnGate.SOURCE) saveVpngate(upd(_state.value.vpngate)) else saveOwn(upd(_state.value.own))
+    }
+
+    /** (Re)starts the VPN interface with the right engine for the servers in use. */
+    private fun startTun(svc: TervynVpnService) {
+        val p = _state.value.prefs
+        val o = ovpn
+        if (o != null && chain.firstOrNull()?.isOpenVpn == true) svc.startTunnel(true, router, o, ::packetDns)
+        else svc.startTunnel(!p.targeted, router)
+    }
+
+    /** DNS in OpenVPN mode: filtered here, then answered by your resolver or sent through the tunnel. */
+    private fun packetDns(query: ByteArray): com.tervyn.vpn.vpn.DnsAction {
+        val q = com.tervyn.vpn.vpn.Dns.parse(query) ?: return com.tervyn.vpn.vpn.DnsAction.Drop
+        return dns.handlePacket(query, q, _state.value.prefs.effectiveDns, ovpn?.pushed?.dns.orEmpty())
     }
 
     /**
@@ -794,8 +986,11 @@ object Core {
             return
         }
         if (servers.isEmpty()) return
+        val wasOvpn = chain.firstOrNull()?.isOpenVpn == true
         try {
             activate(servers)
+            val isOvpn = chain.firstOrNull()?.isOpenVpn == true
+            if (wasOvpn || isOvpn) service?.let { startTun(it) }
         } catch (e: Exception) {
             setStatus { it.copy(warning = e.message ?: e.toString(), state = "on") }
             return
@@ -854,7 +1049,7 @@ object Core {
                     else "No server is answering right now. Tap \"Find fastest servers\" in Locations, or try again in a minute.")
             }
             activate(applyAutoSwitch(_state.value.prefs, servers))
-            svc.startTunnel(fullMode = !prefs.targeted, router = router)
+            startTun(svc)
             cancelRetry()
             if (!wasUp) {
                 lastAt = 0
@@ -864,6 +1059,10 @@ object Core {
             val since = if (wasUp || before.state == "failed" && before.since > 0) before.since.takeIf { it > 0 } ?: System.currentTimeMillis() else System.currentTimeMillis()
             setStatus { connectedStatus(it, since) }
             addRecent(chain.first().id)
+            failedPick?.let { fp ->
+                failedPick = null
+                setStatus { it.copy(warning = "${serverName(fp)} wasn't answering, so you're connected to the fastest working server instead.") }
+            }
             update { it.copy(ipText = "", ipInfo = null, systemKillSwitch = svc.systemKillSwitch()) }
             checkIp()
         } catch (e: Exception) {
@@ -873,6 +1072,7 @@ object Core {
                 chain = emptyList()
                 chainEndpoints = emptyList()
                 hopEntry = null
+                closeOpenVpn()
                 val held = runCatching { svc.startTunnel(fullMode = !prefs.targeted, router = router) }.isSuccess
                 setStatus {
                     it.copy(state = "failed", blocking = held, error = (e.message ?: e.toString()) +
@@ -907,6 +1107,7 @@ object Core {
     }
 
     private fun clearChain() {
+        closeOpenVpn()
         chain = emptyList()
         chainEndpoints = emptyList()
         hopEntry = null
@@ -984,7 +1185,7 @@ object Core {
 
         override fun handleDns(query: ByteArray, q: com.tervyn.vpn.vpn.Dns.Question, proxied: Boolean, fake: (String) -> Int): ByteArray? {
             val st = _state.value
-            return dns.handle(query, q, proxied, st.prefs.dns, chainEndpoints.isNotEmpty(), fake)
+            return dns.handle(query, q, proxied, st.prefs.effectiveDns, chainEndpoints.isNotEmpty(), fake)
         }
     }
 
@@ -1052,6 +1253,16 @@ object Core {
 
     /** Real delay (HTTPS request) through the server in use; shown on Home and in the network monitor. */
     private fun measurePing() {
+        chain.firstOrNull()?.takeIf { it.isOpenVpn }?.let { srv ->
+            pinging = true
+            try {
+                val ms = runCatching { OpenVpnClient.probe(OpenVpnConfig.parse(srv.link), 4000, ::protectSocket, ::protectSocket) }.getOrNull() ?: return
+                update { it.copy(status = it.status.copy(ping = ms), history = it.history.copy(ping = (it.history.ping + ms).takeLast(60))) }
+            } finally {
+                pinging = false
+            }
+            return
+        }
         val eps = chainEndpoints
         val ep = eps.firstOrNull() ?: return
         pinging = true
@@ -1071,6 +1282,7 @@ object Core {
         val l = when (p.source) {
             Prefs.SOURCE_OWN -> s.own
             Prefs.SOURCE_PROXIO -> s.proxio
+            Prefs.SOURCE_VPNGATE -> s.vpngate + s.own.filter { it.sourceId == Warp.SOURCE }
             Prefs.SOURCE_CUSTOM -> s.custom
             Prefs.SOURCE_LIST -> s.list
             Prefs.SOURCE_BOTH -> s.proxio + s.free
@@ -1084,9 +1296,10 @@ object Core {
         if (_state.value.speedTest.running) return@bg
         update { it.copy(speedTest = it.speedTest.copy(running = true, error = "")) }
         val st = _state.value
-        val target = (if (st.on) chain.firstOrNull() else null) ?: sourcePool(st.prefs).firstOrNull()
+        val target = ((if (st.on) chain.firstOrNull() else null) ?: sourcePool(st.prefs).firstOrNull { !it.isOpenVpn })
+            ?.takeIf { !it.isOpenVpn }
         if (target == null) {
-            update { it.copy(speedTest = SpeedTest(error = "No working server to test yet. Tap \"Find fastest servers\" first.", at = System.currentTimeMillis())) }
+            update { it.copy(speedTest = SpeedTest(error = if (st.on && chain.firstOrNull()?.isOpenVpn == true) "Watch the live speed on Home while you browse: the speed test works with proxy, WireGuard and Xray servers." else "No working server to test yet. Tap \"Find fastest servers\" first.", at = System.currentTimeMillis())) }
             return@bg
         }
         var result: ProxyTester.Result? = null
@@ -1164,6 +1377,13 @@ object Core {
         }
     }
 
+    /** DNS Center master switch. Off: Automatic DNS, no filtering. */
+    fun setDnsEnabled(on: Boolean) {
+        savePrefs { it.copy(dnsEnabled = on) }
+        dns.clear()
+        if (on) bg { refreshLists(force = false) }
+    }
+
     /** DNS Center → Update lists now. */
     fun updateListsNow() = bg { refreshLists(force = true) }
 
@@ -1182,7 +1402,7 @@ object Core {
         if (_state.value.dnsTest.running) return@bg
         update { it.copy(dnsTest = it.dnsTest.copy(running = true)) }
         val st = _state.value
-        val items = runCatching { dns.test(st.prefs.dns, chainEndpoints.isNotEmpty(), !st.prefs.targeted, st.prefs.ipv6Block) }
+        val items = runCatching { dns.test(st.prefs.effectiveDns, chainEndpoints.isNotEmpty() || ovpn != null, !st.prefs.targeted || ovpn != null, st.prefs.ipv6Block) }
             .getOrElse { listOf(DnsManager.TestItem("DNS test", false, it.message ?: it.toString())) }
         update { it.copy(dnsTest = TestRun(false, System.currentTimeMillis(), items)) }
     }
@@ -1221,7 +1441,7 @@ object Core {
             _state.value.ipInfo?.let { "${it.ip} · ${listOf(it.city, it.country).filter { s -> s.isNotBlank() }.joinToString(", ")}" + if (it.viaVpn) " (through VPN)" else " (your network)" }
                 ?: throw IOException(_state.value.ipText)
         }
-        items += dns.test(st.prefs.dns, chainEndpoints.isNotEmpty(), !st.prefs.targeted, st.prefs.ipv6Block)
+        items += dns.test(st.prefs.effectiveDns, chainEndpoints.isNotEmpty() || ovpn != null, !st.prefs.targeted || ovpn != null, st.prefs.ipv6Block)
             .filter { it.name.startsWith("IPv4") || it.name.contains("leak") }
         st.systemKillSwitch?.let { (alwaysOn, lockdown) ->
             items += DnsManager.TestItem("System kill switch", lockdown,
@@ -1237,7 +1457,7 @@ object Core {
         val svc = service ?: return
         if (!_state.value.tunnelUp) return
         val p = _state.value.prefs
-        bg { runCatching { svc.startTunnel(!p.targeted, router) }.onFailure { e -> setStatus { it.copy(error = e.message ?: e.toString()) } } }
+        bg { runCatching { startTun(svc) }.onFailure { e -> setStatus { it.copy(error = e.message ?: e.toString()) } } }
     }
 
     fun setKillSwitch(on: Boolean) { savePrefs { it.copy(killSwitch = on) } }
@@ -1332,7 +1552,7 @@ object Core {
         val p = savePrefs { it.copy(mode = mode) }
         // The VPN routes differ between the modes, so rebuild the tunnel.
         if (_state.value.on) service?.let { svc ->
-            if (p.targeted && p.sites.isEmpty()) disconnect() else bg { svc.startTunnel(!p.targeted, router) }
+            if (p.targeted && p.sites.isEmpty()) disconnect() else bg { runCatching { startTun(svc) } }
         }
     }
 
@@ -1345,6 +1565,7 @@ object Core {
             // Make sure the new source has servers, then move the connection over.
             if (p.usesFree && _state.value.free.none { it.ms != null }) refreshFreeAsync()
             if (p.usesProxio && _state.value.proxio.none { it.ms != null }) runCatching { refreshProxio() }
+            if (p.source == Prefs.SOURCE_VPNGATE) runCatching { refreshVpnGate(force = false) }
             if (_state.value.on) repick()
         }
     }
@@ -1416,7 +1637,12 @@ object Core {
     class ImportResult(val added: Int, val skipped: Int, val core: Int, val switched: Boolean)
 
     private fun importText(text: String, source: Source): ImportResult {
-        val parsed = Links.parse(text, source.id)
+        val parsed = if (Regex("(?m)^\\s*remote\\s").containsMatchIn(text) && text.contains("<ca>")) {
+            // An OpenVPN config (.ovpn).
+            val cfg = OpenVpnConfig.parse(text)
+            val name = Regex("(?m)^#\\s*(.+)$").find(text)?.groupValues?.get(1)?.trim()?.take(60) ?: "OpenVPN ${cfg.host}"
+            Links.Parsed(listOf(Server.make("openvpn", cfg.host, cfg.port, "", source = source.id, free = false, name = name).copy(link = text)), 0, name)
+        } else Links.parse(text, source.id)
         if (parsed.servers.isEmpty()) throw IOException("No usable servers found in this text.")
         val core = parsed.servers.count { it.isCore }
         if (core > 0 && !xrayIncluded && core == parsed.servers.size) throw IOException(XRAY_MISSING)
@@ -1464,6 +1690,25 @@ object Core {
             update { it.copy(ownTesting = left > 0) }
         }
     }
+
+    /**
+     * Server sources → Cloudflare WARP: signs this phone up for Cloudflare's free
+     * WireGuard service and adds it as a server. Returns a message for the user.
+     */
+    fun addWarp(): String {
+        if (xrayBin == null) throw IOException(XRAY_MISSING)
+        val link = Warp.register()
+        val srv = Links.parse(link, Warp.SOURCE).servers.firstOrNull()
+            ?: throw IOException("Couldn't read Cloudflare's WireGuard settings.")
+        saveOwn(_state.value.own.filter { it.sourceId != Warp.SOURCE } + srv)
+        testOwn(listOf(srv))
+        val t = _state.value.own.firstOrNull { it.sourceId == Warp.SOURCE }
+        if (_state.value.on) bg { repick() }
+        return if (t?.ms != null) "Cloudflare WARP is ready (${t.ms} ms). It's used with VPN Gate and Your own servers."
+        else "Cloudflare WARP was added but didn't answer the test yet. Your network may block WireGuard (UDP 2408)."
+    }
+
+    fun removeWarp() = saveOwn(_state.value.own.filter { it.sourceId != Warp.SOURCE })
 
     fun importPasted(text: String): ImportResult =
         importText(text, Source(hashId("paste:" + System.currentTimeMillis()), "paste", "", "Pasted servers", 0, 0, 0))
@@ -1514,9 +1759,14 @@ object Core {
             Prefs.SOURCE_OWN -> testOwn(_state.value.own)
             Prefs.SOURCE_PROXIO -> runCatching { refreshProxio() }
             Prefs.SOURCE_BOTH -> { runCatching { refreshProxio() }; refreshFree(force = true) }
+            Prefs.SOURCE_VPNGATE -> {
+                runCatching { refreshVpnGate(force = true) }
+                _state.value.own.filter { it.sourceId == Warp.SOURCE }.takeIf { it.isNotEmpty() }?.let { testOwn(it) }
+            }
             else -> refreshFree(force = true)
         }
-        if (_state.value.on && p.selected == "auto") repick()
+        // Don't switch away from a working OpenVPN connection just because the list was refreshed.
+        if (_state.value.on && p.selected == "auto" && chain.firstOrNull()?.isOpenVpn != true) repick()
     }
 
     // =====================================================================
@@ -1527,6 +1777,13 @@ object Core {
 
     /** Public address as websites see it (through the VPN server when connected). */
     private fun checkIpNow() {
+        val o = chain.firstOrNull()
+        if (_state.value.on && o != null && o.isOpenVpn && ovpn != null) {
+            // Tervyn itself stays outside the tunnel, so show the OpenVPN server's address: that's where your traffic exits.
+            val info = IpInfo(o.address, "", "", o.country.takeIf { it != "Unknown" }.orEmpty(), o.code, "OpenVPN server's address", true, System.currentTimeMillis())
+            update { it.copy(ipInfo = info, ipText = "Your traffic exits from ${o.address} ${o.flag}".trim()) }
+            return
+        }
         update { it.copy(ipText = "Checking your IP…") }
         try {
             val eps = chainEndpoints

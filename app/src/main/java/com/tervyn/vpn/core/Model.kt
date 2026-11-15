@@ -36,6 +36,8 @@ data class Server(
     /** Needs Xray (VLESS, VMess, Trojan, Shadowsocks). Plain SOCKS5 / HTTP servers don't. */
     val isCore: Boolean get() = proto in CORE_PROTOS
     val isProxio: Boolean get() = sourceId == PROXIO_SOURCE
+    /** OpenVPN server (VPN Gate or your own .ovpn): carries whole IP packets, all apps only. */
+    val isOpenVpn: Boolean get() = proto == "openvpn"
     val flag: String get() = flagFromCode(code)
     val country: String get() = countryName(code)
     val hostPort: String get() = "$address:$port"
@@ -86,12 +88,13 @@ data class Prefs(
     val sites: List<String> = emptyList(),
     val autoPool: Int = 5,              // servers kept ready (first one + backups)
     val country: String = "",           // limit auto mode to one country code ("" = any)
-    val source: String = SOURCE_FREE,   // where auto mode gets servers from
+    val source: String = SOURCE_VPNGATE,   // where auto mode gets servers from
     val autoSwitch: Boolean = true,     // true: always use the fastest server and switch automatically
     val showSpeed: Boolean = true,      // live download / upload speed on the Home screen
     val speedInNotification: Boolean = true,
     // DNS Center
     val dns: DnsConfig = DnsConfig(),
+    val dnsEnabled: Boolean = true,     // DNS Center master switch (off = VPN server's / automatic DNS, no filtering)
     val dnsProfiles: List<DnsProfile> = emptyList(),
     val dnsProfile: String = "",        // id of the profile in use ("" = none)
     val dnsDefaultProfile: String = "",
@@ -118,6 +121,8 @@ data class Prefs(
 ) {
     val targeted get() = mode == MODE_TARGETED
     val usesFree get() = source == SOURCE_FREE || source == SOURCE_BOTH
+    /** DNS settings in effect: with Tervyn DNS turned off, plain Automatic (no filtering). */
+    val effectiveDns: DnsConfig get() = if (dnsEnabled) dns else DnsConfig()
     val usesProxio get() = source == SOURCE_PROXIO || source == SOURCE_BOTH
 
     fun toJson(): JSONObject = JSONObject().apply {
@@ -126,7 +131,7 @@ data class Prefs(
         put("source", source)
         put("autoSwitch", autoSwitch)
         put("showSpeed", showSpeed); put("speedInNotification", speedInNotification)
-        put("dnsConfig", dns.toJson())
+        put("dnsConfig", dns.toJson()); put("dnsEnabled", dnsEnabled)
         put("dnsProfiles", JSONArray(dnsProfiles.map { it.toJson() }))
         put("dnsProfile", dnsProfile); put("dnsDefaultProfile", dnsDefaultProfile)
         put("killSwitch", killSwitch); put("ipv6Block", ipv6Block)
@@ -148,6 +153,7 @@ data class Prefs(
         const val SOURCE_OWN = "own"         // your own servers (VLESS, VMess, Trojan, SS, WireGuard, SOCKS, HTTP)
         const val SOURCE_CUSTOM = "custom"   // proxy integration: pasted curl / Python / Node.js code
         const val SOURCE_LIST = "list"       // proxy list file (host:port:user:pass lines)
+        const val SOURCE_VPNGATE = "vpngate" // VPN Gate public OpenVPN servers
         const val SPLIT_ALL = "all"
         const val SPLIT_EXCLUDE = "exclude"
         const val SPLIT_INCLUDE = "include"
@@ -159,7 +165,7 @@ data class Prefs(
 
         /** Protocols the app can use, for the protocol setting. */
         val PROTOCOLS = listOf(
-            PROTO_AUTO to "Automatic", "wireguard" to "WireGuard", "vless" to "VLESS", "vmess" to "VMess",
+            PROTO_AUTO to "Automatic", "openvpn" to "OpenVPN", "wireguard" to "WireGuard", "vless" to "VLESS", "vmess" to "VMess",
             "trojan" to "Trojan", "shadowsocks" to "Shadowsocks", "socks5" to "SOCKS5", "http" to "HTTP",
         )
 
@@ -173,11 +179,11 @@ data class Prefs(
                 enabled = o.optBoolean("enabled"), mode = o.optString("mode", MODE_FULL),
                 selected = o.optString("selected", "auto"), sites = list("sites"),
                 autoPool = o.optInt("autoPool", 5), country = o.optString("country"),
-                source = o.optString("source", SOURCE_FREE),
+                source = o.optString("source", SOURCE_VPNGATE),
                 autoSwitch = o.optBoolean("autoSwitch", true),
                 showSpeed = o.optBoolean("showSpeed", true),
                 speedInNotification = o.optBoolean("speedInNotification", true),
-                dns = dns, dnsProfiles = profiles,
+                dns = dns, dnsProfiles = profiles, dnsEnabled = o.optBoolean("dnsEnabled", true),
                 dnsProfile = o.optString("dnsProfile"), dnsDefaultProfile = o.optString("dnsDefaultProfile"),
                 killSwitch = o.optBoolean("killSwitch", true), ipv6Block = o.optBoolean("ipv6Block", true),
                 splitMode = o.optString("splitMode", SPLIT_ALL), splitApps = list("splitApps"),
@@ -280,6 +286,8 @@ data class AppState(
     val customCode: String = "",
     val customStatus: ProxioStatus = ProxioStatus(),
     val list: List<Server> = emptyList(),          // proxies from your .txt proxy list
+    val vpngate: List<Server> = emptyList(),       // VPN Gate OpenVPN servers
+    val vpngateStatus: ProxioStatus = ProxioStatus(),
     val listName: String = "",
     val listStatus: ProxioStatus = ProxioStatus(),
     val sources: List<Source> = emptyList(),
@@ -298,7 +306,7 @@ data class AppState(
     val listsUpdating: Set<String> = emptySet(),
     val systemKillSwitch: Pair<Boolean, Boolean>? = null,   // (always-on VPN, block connections without VPN), Android 10+
 ) {
-    val servers: List<Server> get() = (list + custom + proxio + free + own).distinctBy { it.id }
+    val servers: List<Server> get() = (vpngate + list + custom + proxio + free + own).distinctBy { it.id }
     val on: Boolean get() = prefs.enabled && (status.state == "on" || status.state == "reconnecting")
     val connecting: Boolean get() = status.state == "connecting"
     val reconnecting: Boolean get() = status.state == "reconnecting"

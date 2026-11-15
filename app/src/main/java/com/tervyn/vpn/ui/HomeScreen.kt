@@ -138,6 +138,7 @@ fun HomeScreen(st: AppState, nav: Nav, onPower: () -> Unit) {
 
         if (st.status.error.isNotEmpty()) Alert(st.status.error, onClose = Core::clearError)
         if (on && st.status.warning.isNotEmpty()) Alert(st.status.warning, warn = true, onClose = Core::clearError)
+        PermissionBanner(nav)
 
         // Location
         VSpace(18)
@@ -242,7 +243,7 @@ fun HomeScreen(st: AppState, nav: Nav, onPower: () -> Unit) {
         // Shortcuts
         SectionLabel("Tools")
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Shortcut("DNS Center", st.prefs.dns.label, TIcons.dns, Modifier.weight(1f)) { nav.open(Routes.DNS) }
+            Shortcut("DNS Center", if (st.prefs.dnsEnabled) st.prefs.dns.label else "Off", TIcons.dns, Modifier.weight(1f)) { nav.open(Routes.DNS) }
             Shortcut("Monitor", if (on) formatRate(st.traffic.down + st.traffic.up) else "Live charts", TIcons.chart, Modifier.weight(1f)) { nav.open(Routes.MONITOR) }
         }
         VSpace(10)
@@ -277,6 +278,7 @@ fun sourceName(source: String): String = when (source) {
     Prefs.SOURCE_OWN -> "your servers"
     Prefs.SOURCE_CUSTOM -> "integration proxies"
     Prefs.SOURCE_LIST -> "your proxy list"
+    Prefs.SOURCE_VPNGATE -> "VPN Gate + WARP"
     else -> "free servers"
 }
 

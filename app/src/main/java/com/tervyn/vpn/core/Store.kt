@@ -23,6 +23,11 @@ class Store(context: Context) {
     fun proxioServers(): List<Server> = servers("proxioServers")
     fun saveProxioServers(l: List<Server>) = put("proxioServers", JSONArray(l.map { it.toJson() }).toString())
 
+    fun vpngateServers(): List<Server> = servers("vpngateServers")
+    fun saveVpngateServers(l: List<Server>) = put("vpngateServers", JSONArray(l.map { it.toJson() }).toString())
+    fun vpngateStatus(): ProxioStatus = ProxioStatus.fromJson(obj("vpngateStatus"))
+    fun saveVpngateStatus(s: ProxioStatus) = put("vpngateStatus", s.toJson().toString())
+
     fun proxioConfig(): Proxio.Config = Proxio.Config.fromJson(obj("proxio"))
     fun saveProxioConfig(c: Proxio.Config) = put("proxio", c.toJson().toString())
 

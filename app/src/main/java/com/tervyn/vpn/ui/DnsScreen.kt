@@ -55,7 +55,7 @@ fun DnsScreen(st: AppState, nav: Nav) {
                 IconBubble(TIcons.dns, if (dns.encrypted || dns.mode == DnsConfig.AUTO) C.green else C.amber, 44.dp)
                 HSpace(12)
                 Column(Modifier.weight(1f)) {
-                    Text(dns.label, color = C.text, fontWeight = FontWeight.Bold, fontSize = 17.sp, fontFamily = Fonts.display,
+                    Text(if (p.dnsEnabled) dns.label else "Tervyn DNS is off", color = C.text, fontWeight = FontWeight.Bold, fontSize = 17.sp, fontFamily = Fonts.display,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Muted(
                         when {
@@ -97,6 +97,15 @@ fun DnsScreen(st: AppState, nav: Nav) {
             }
         }
 
+        // ---------------- master switch
+        VSpace(12)
+        GlassCard(padding = PaddingValues(0.dp)) {
+            SettingRow(TIcons.dns, "Tervyn DNS",
+                if (p.dnsEnabled) "On: your resolver, leak protection and blocking below are used"
+                else "Off: apps use Automatic DNS through the VPN, nothing is filtered",
+                checked = p.dnsEnabled, onCheckedChange = Core::setDnsEnabled)
+        }
+        if (p.dnsEnabled) {
         // ---------------- configuration
         SectionLabel("DNS server")
         GroupCard {
@@ -225,6 +234,7 @@ fun DnsScreen(st: AppState, nav: Nav) {
         // ---------------- profiles
         SectionLabel("Profiles")
         ProfilesCard(st)
+        }
     }
 }
 

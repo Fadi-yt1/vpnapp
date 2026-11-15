@@ -61,11 +61,37 @@ class MainActivity : ComponentActivity() {
         else Toast.makeText(this, "Tervyn needs VPN permission to protect your connection.", Toast.LENGTH_LONG).show()
     }
 
-    /** Onboarding: ask for VPN permission without connecting yet. */
-    private val vpnPermissionOnly = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { }
+    /** Onboarding / Permissions: ask for VPN permission without connecting yet. */
+    private val vpnPermissionOnly = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { permTick++ }
 
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        permTick++
         startVpn()
+    }
+
+    private val notificationPermissionOnly = registerForActivityResult(ActivityResultContracts.RequestPermission()) { permTick++ }
+
+    /** Bumped when a permission may have changed, so the screens re-check. */
+    private var permTick by mutableIntStateOf(0)
+
+    private fun perms(): Perms {
+        val notif = Build.VERSION.SDK_INT < 33 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val battery = Build.VERSION.SDK_INT < 23 || getSystemService(android.os.PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName) == true
+        return Perms(
+            vpn = VpnService.prepare(this) == null, notifications = notif, battery = battery,
+            requestVpn = ::askVpnPermission,
+            requestNotifications = {
+                if (Build.VERSION.SDK_INT >= 33) notificationPermissionOnly.launch(Manifest.permission.POST_NOTIFICATIONS)
+            },
+            requestBattery = {
+                runCatching {
+                    @android.annotation.SuppressLint("BatteryLife")
+                    val i = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:$packageName"))
+                    startActivity(i)
+                }.onFailure { runCatching { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } }
+            },
+            openVpnSettings = { runCatching { startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS)) } },
+        )
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -88,7 +114,10 @@ class MainActivity : ComponentActivity() {
                         isAppearanceLightNavigationBars = !dark
                     }
                 }
-                App(st, onPower = ::onPower, askVpnPermission = ::askVpnPermission)
+                val perms = remember(permTick) { perms() }
+                androidx.compose.runtime.CompositionLocalProvider(LocalPerms provides perms) {
+                    App(st, onPower = ::onPower, askVpnPermission = ::askVpnPermission)
+                }
             }
         }
         handleShare(intent)
@@ -105,6 +134,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        permTick++
         Core.ensureFree()   // find free servers in the background if the list is old
     }
 
@@ -174,6 +204,7 @@ object Routes {
     const val ABOUT = "about"
     const val HELP = "help"
     const val PRIVACY = "privacy"
+    const val PERMISSIONS = "permissions"
 }
 
 private val TABS = listOf(
@@ -231,6 +262,7 @@ fun App(st: AppState, onPower: () -> Unit, askVpnPermission: () -> Unit) {
                 Routes.CONNECTION -> ConnectionScreen(st, nav)
                 Routes.AUTOCONNECT -> AutoConnectScreen(st, nav)
                 Routes.ABOUT, Routes.HELP, Routes.PRIVACY -> InfoScreen(r, nav)
+                Routes.PERMISSIONS -> PermissionsScreen(st, nav)
                 else -> HomeScreen(st, nav, onPower)
             }
         }

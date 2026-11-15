@@ -67,6 +67,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.drawOutline
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -142,14 +144,12 @@ fun Modifier.glass(shape: Shape = ShapeCard, selected: Boolean = false, strong: 
     }
     return this
         .drawBehind {
-            // Soft drop shadow under the glass.
+            // Soft drop shadow under the glass, following its shape.
             if (!p.isDark || strong) {
-                val r = 26.dp.toPx()
-                drawRoundRect(
-                    Brush.verticalGradient(listOf(Color.Transparent, p.shadow), startY = size.height * 0.4f, endY = size.height + 10.dp.toPx()),
-                    topLeft = Offset(6.dp.toPx(), 8.dp.toPx()), size = size.copy(width = size.width - 12.dp.toPx()),
-                    cornerRadius = CornerRadius(r, r),
-                )
+                val outline = shape.createOutline(size, layoutDirection, this)
+                translate(0f, 5.dp.toPx()) {
+                    drawOutline(outline, Brush.verticalGradient(listOf(Color.Transparent, p.shadow), startY = size.height * 0.5f, endY = size.height))
+                }
             }
         }
         .clip(shape)
@@ -164,6 +164,7 @@ fun Modifier.glass(shape: Shape = ShapeCard, selected: Boolean = false, strong: 
                 ),
             ) else Modifier,
         )
+        .then(if (strong && !blur) Modifier.background(p.bg1.copy(alpha = if (p.isDark) 0.88f else 0.82f)) else Modifier)
         .background(fill)
         .drawBehind {
             // Specular highlight along the top edge.
@@ -243,7 +244,7 @@ fun CardRow(
     content: @Composable RowScope.() -> Unit,
 ) {
     GlassCard(modifier, onClick, selected, PaddingValues(horizontal = 14.dp, vertical = 12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp), content = content)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp), content = content)
     }
 }
 
@@ -870,10 +871,10 @@ fun ServerRow(
 ) {
     CardRow(onClick = onClick, selected = selected) {
         if (rank != null) {
-            Text("$rank", color = if (rank <= 3) C.accentLight else C.muted, fontWeight = FontWeight.Bold, fontSize = 13.sp,
-                modifier = Modifier.width(20.dp), textAlign = TextAlign.Center)
+            Text("$rank", color = if (rank <= 3) C.accentLight else C.muted, fontWeight = FontWeight.Bold, fontSize = 12.sp,
+                modifier = Modifier.width(16.dp), textAlign = TextAlign.Center)
         }
-        FlagBadge(s?.flag, 40)
+        FlagBadge(s?.flag, 36)
         Column(Modifier.weight(1f)) {
             Text(
                 if (s == null) "Fastest available" else if (s.country != "Unknown") s.country else s.name,
@@ -895,7 +896,7 @@ fun ServerRow(
                 if (favorite) TIcons.starFilled else TIcons.star,
                 if (favorite) "Remove from favorites" else "Add to favorites",
                 tint = if (favorite) C.amber else C.muted,
-                modifier = Modifier.size(40.dp).clip(CircleShape).clickable(onClick = onFavorite).padding(10.dp),
+                modifier = Modifier.size(36.dp).clip(CircleShape).clickable(onClick = onFavorite).padding(8.dp),
             )
         }
     }

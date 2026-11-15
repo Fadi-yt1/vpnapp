@@ -2,6 +2,10 @@ package com.tervyn.vpn.ui
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.requiredHeight
+import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -41,10 +45,11 @@ class ScreenshotTest(private val theme: String) {
         @Parameterized.Parameters(name = "{0}")
         fun themes() = listOf(Prefs.THEME_PURPLE, Prefs.THEME_DARK, Prefs.THEME_LIGHT)
 
+        // 360 x 1000 dp at 2x; Paparazzi saves images at most 1000 px tall, so long pages are
+        // captured in 1000 dp segments ("_p0", "_p1", …).
         private val phone = DeviceConfig.PIXEL_5.copy(
-            screenWidth = 720, screenHeight = 1560, xdpi = 320, ydpi = 320, density = Density.XHIGH,
+            screenWidth = 720, screenHeight = 2000, xdpi = 320, ydpi = 320, density = Density.XHIGH,
         )
-        private val tall = phone.copy(screenHeight = 4000)
 
         private val servers = listOf(
             Triple("DE", "socks5", 210), Triple("NL", "vless", 260), Triple("US", "wireguard", 340),
@@ -108,43 +113,31 @@ class ScreenshotTest(private val theme: String) {
         }
     }
 
-    @Test fun home_connected() = paparazzi.snapshot { WithTabs(connected, 0) { HomeScreen(connected, it) {} } }
+    /** Long page: rendered [segments] × 1000 dp tall, saved as one image per 1000 dp. */
+    private fun long(name: String, segments: Int, st: AppState, tab: Int?, content: @Composable (Nav) -> Unit) {
+        for (i in 0 until segments) {
+            paparazzi.snapshot(name = "${name}_p$i") {
+                val page: @Composable (Nav) -> Unit = { nav ->
+                    Box(
+                        Modifier.fillMaxSize().wrapContentHeight(Alignment.Top, unbounded = true)
+                            .requiredHeight((segments * 1000).dp).offset(y = (-i * 1000).dp),
+                    ) { content(nav) }
+                }
+                if (tab != null) WithTabs(st, tab, page) else Shot(st, page)
+            }
+        }
+    }
+
+    @Test fun home() = long("home", 2, connected, 0) { HomeScreen(connected, it) {} }
     @Test fun home_off() = paparazzi.snapshot { WithTabs(off, 0) { HomeScreen(off, it) {} } }
-
-    @Test fun home_full() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = tall)
-        paparazzi.snapshot { WithTabs(connected, 0) { HomeScreen(connected, it) {} } }
-    }
-
-    @Test fun locations() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = tall)
-        paparazzi.snapshot { WithTabs(connected, 1) { LocationsScreen(connected, it) } }
-    }
-
-    @Test fun security() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = tall)
-        paparazzi.snapshot { WithTabs(connected, 2) { SecurityScreen(connected, it) } }
-    }
-
-    @Test fun settings() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = tall)
-        paparazzi.snapshot { WithTabs(connected, 3) { SettingsScreen(connected, it) } }
-    }
-
-    @Test fun dns() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = tall)
-        paparazzi.snapshot { Shot(connected) { DnsScreen(connected, it) } }
-    }
-
-    @Test fun monitor() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = phone.copy(screenHeight = 2600))
-        paparazzi.snapshot { Shot(connected) { MonitorScreen(connected, it) } }
-    }
-
+    @Test fun locations() = long("locations", 2, connected, 1) { LocationsScreen(connected, it) }
+    @Test fun security() = long("security", 2, connected, 2) { SecurityScreen(connected, it) }
+    @Test fun settings() = long("settings", 2, connected, 3) { SettingsScreen(connected, it) }
+    @Test fun dns() = long("dns", 3, connected, null) { DnsScreen(connected, it) }
+    @Test fun monitor() = long("monitor", 2, connected, null) { MonitorScreen(connected, it) }
     @Test fun appearance() {
-        paparazzi.unsafeUpdateConfig(deviceConfig = phone.copy(screenHeight = 2400))
-        paparazzi.snapshot { Shot(connected.copy(prefs = connected.prefs.copy(theme = theme))) { AppearanceScreen(connected.copy(prefs = connected.prefs.copy(theme = theme)), it) } }
+        val st = connected.copy(prefs = connected.prefs.copy(theme = theme))
+        long("appearance", 2, st, null) { AppearanceScreen(st, it) }
     }
-
     @Test fun onboarding() = paparazzi.snapshot { Shot(off) { OnboardingScreen(off, {}) {} } }
 }

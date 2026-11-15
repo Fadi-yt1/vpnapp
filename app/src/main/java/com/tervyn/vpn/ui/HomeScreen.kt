@@ -173,8 +173,8 @@ fun HomeScreen(st: AppState, nav: Nav, onPower: () -> Unit) {
         GlassCard(padding = PaddingValues(0.dp)) {
             SettingRow(
                 TIcons.sparkle, "Smart Connect",
-                if (prefs.selected == "auto" && prefs.autoSwitch) "Uses the fastest working server and switches if it slows down"
-                else "Off: stays on the server you chose",
+                if (prefs.selected == "auto" && prefs.autoSwitch) "Fastest server, switches automatically"
+                else "Off: stays on your chosen server",
                 checked = prefs.selected == "auto" && prefs.autoSwitch,
                 onCheckedChange = { onOff ->
                     if (onOff) { Core.select("auto"); Core.setAutoSwitch(true) } else Core.setAutoSwitch(false)

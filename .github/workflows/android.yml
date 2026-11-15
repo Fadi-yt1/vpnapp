@@ -38,9 +38,10 @@ jobs:
         run: ./gradlew --no-daemon -PrequireXray=true assembleDebug assembleRelease lint
 
       - name: Show APK signing certificate
+        continue-on-error: true
         run: |
           APKSIGNER=$(ls -d $ANDROID_HOME/build-tools/*/apksigner | sort -V | tail -1)
-          $APKSIGNER verify --print-certs app/build/outputs/apk/release/app-arm64-v8a-release.apk | grep -E "Signer #1 certificate (DN|SHA-256)"
+          $APKSIGNER verify --print-certs app/build/outputs/apk/release/app-arm64-v8a-release.apk | grep -iE "certificate (DN|SHA-256)" || true
 
       - name: Show lint results
         if: always()

@@ -325,7 +325,7 @@ class OpenVpnClient(
                     while (true) { val t = engine.delegatedTask ?: break; t.run() }
                 }
                 SSLEngineResult.HandshakeStatus.NEED_WRAP -> wrapAndSend(ByteArray(0))
-                SSLEngineResult.HandshakeStatus.NEED_UNWRAP, SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN -> {
+                SSLEngineResult.HandshakeStatus.NEED_UNWRAP -> {
                     if (!unwrapOnce()) break
                 }
                 else -> {
